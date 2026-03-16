@@ -289,12 +289,36 @@ export default function TransactionsSection() {
             color: "#444",
             borderBottom: "1px solid #111",
           }}>
-            <span>Time</span>
-            <span>Type</span>
-            <span>Amount</span>
-            <span>USD</span>
-            <span>Wallet</span>
-            <span>Event</span>
+            <span>
+              <InfoTip text="When the transaction was confirmed on the Solana blockchain (block time). Displayed in your local timezone.">
+                Time
+              </InfoTip>
+            </span>
+            <span>
+              <InfoTip text={`The classified transaction type. Possible values:\n\n• BUY (green) — A swap where the trader bought SOL with USDC\n• SELL (red) — A swap where the trader sold SOL for USDC\n• ADD LIQ (blue) — Liquidity provider deposited tokens into the pool\n• REM LIQ (yellow) — Liquidity provider withdrew tokens from the pool\n• INIT (purple) — A new pool was initialized/created\n• OTHER (gray) — Transaction touched the pool but wasn't a swap (e.g. bots checking prices, crank operations, oracle updates)\n• UNPARSED (dark) — Non-AMM v4 pools where we collect data but don't parse yet (CPMM, Orca, Meteora)\n• FAILED — Transaction was submitted but failed on-chain\n• ERR — We couldn't fetch the full transaction data from the RPC`}>
+                Type
+              </InfoTip>
+            </span>
+            <span>
+              <InfoTip text="The amount of SOL (base token) involved in the swap. For buy transactions, this is how much SOL the trader received. For sell transactions, this is how much SOL the trader gave up. Only available for parsed swap transactions.">
+                Amount
+              </InfoTip>
+            </span>
+            <span>
+              <InfoTip text="The estimated USD value of the transaction, calculated from the USDC (quote token) side of the swap. Since USDC is a stablecoin pegged to $1, the USDC amount directly approximates the USD value.">
+                USD
+              </InfoTip>
+            </span>
+            <span>
+              <InfoTip text="The Solana wallet address of the trader who initiated the transaction (the fee payer / signer). Shown truncated — first 4 and last 4 characters. Many transactions are from automated trading bots, not human traders.">
+                Wallet
+              </InfoTip>
+            </span>
+            <span>
+              <InfoTip text={`Special event classification for notable transactions:\n\n• 🐋 whale — A swap exceeding $25,000 in value. Large enough to visibly move the pool price.\n• 💧 liq — Liquidity was added to or removed from the pool by an LP (liquidity provider).\n• 🆕 new — A brand new pool was created on-chain.\n\nRegular swaps under $25K don't show an event badge.`}>
+                Event
+              </InfoTip>
+            </span>
           </div>
 
           {/* Transaction rows */}

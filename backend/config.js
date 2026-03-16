@@ -110,8 +110,10 @@ function getNextPool() {
 // Timing
 const HEALTH_CHECK_INTERVAL = 5000; // 5 seconds
 const HTTP_TIMEOUT = 3000; // 3 seconds
-const WS_HEARTBEAT_TIMEOUT = 30000; // 30 seconds
-const WS_MAX_RETRIES = 3;
+const WS_HEARTBEAT_TIMEOUT = 120000; // 120 seconds (public endpoints can be slow)
+const WS_MAX_RETRIES = 5;
+const WS_RECOVERY_INTERVAL = 300000; // 5 minutes — retry dead connections periodically
+const WS_PING_INTERVAL = 30000; // 30 seconds — send WS ping frames to keep alive
 // Keep enough results for long-range charts (3 days at 5s = 51840, cap at 72h)
 const RESULTS_WINDOW = 51840;
 const FAILOVER_POLL_INTERVAL = 2000; // 2 seconds
@@ -125,6 +127,8 @@ module.exports = {
   HTTP_TIMEOUT,
   WS_HEARTBEAT_TIMEOUT,
   WS_MAX_RETRIES,
+  WS_RECOVERY_INTERVAL,
+  WS_PING_INTERVAL,
   RESULTS_WINDOW,
   FAILOVER_POLL_INTERVAL,
   HELIUS_API_KEY,

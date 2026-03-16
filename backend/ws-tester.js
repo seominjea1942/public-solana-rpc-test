@@ -1,5 +1,12 @@
 const WebSocket = require("ws");
-const { RPC_ENDPOINTS, TEST_ACCOUNT, WS_HEARTBEAT_TIMEOUT, WS_MAX_RETRIES } = require("./config");
+const {
+  RPC_ENDPOINTS,
+  TEST_ACCOUNT,
+  WS_HEARTBEAT_TIMEOUT,
+  WS_MAX_RETRIES,
+  WS_RECOVERY_INTERVAL,
+  WS_PING_INTERVAL,
+} = require("./config");
 const { writeWsLog } = require("./database");
 
 // In-memory store for WS status
@@ -38,6 +45,16 @@ function connectWs(endpoint) {
     return;
   }
 
+  // Clean up any existing connection before creating a new one
+  const existing = wsConnections.get(endpoint.name);
+  if (existing) {
+    if (existing.heartbeatTimer) clearTimeout(existing.heartbeatTimer);
+    if (existing.pingTimer) clearInterval(existing.pingTimer);
+    if (existing.ws && existing.ws.readyState !== WebSocket.CLOSED) {
+      try { existing.ws.close(1000, "reconnecting"); } catch {}
+    }
+  }
+
   data.status = "connecting";
 
   let ws;
@@ -49,16 +66,19 @@ function connectWs(endpoint) {
   }
 
   let heartbeatTimer = null;
+  let pingTimer = null;
 
   function resetHeartbeat() {
     if (heartbeatTimer) clearTimeout(heartbeatTimer);
     heartbeatTimer = setTimeout(() => {
-      // No message for 30 seconds — connection is dead
-      try { writeWsLog(endpoint.name, "heartbeat_timeout", null, "No message for 30s"); } catch {}
+      try { writeWsLog(endpoint.name, "heartbeat_timeout", null, `No message for ${WS_HEARTBEAT_TIMEOUT / 1000}s`); } catch {}
       if (ws.readyState === WebSocket.OPEN) {
         ws.close(1000, "heartbeat timeout");
       }
     }, WS_HEARTBEAT_TIMEOUT);
+    // Update stored timer reference
+    const conn = wsConnections.get(endpoint.name);
+    if (conn) conn.heartbeatTimer = heartbeatTimer;
   }
 
   ws.on("open", () => {
@@ -82,6 +102,21 @@ function connectWs(endpoint) {
       })
     );
 
+    resetHeartbeat();
+
+    // Start periodic ping to keep the connection alive
+    pingTimer = setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        try { ws.ping(); } catch {}
+      }
+    }, WS_PING_INTERVAL);
+
+    const conn = wsConnections.get(endpoint.name);
+    if (conn) conn.pingTimer = pingTimer;
+  });
+
+  // Pong responses from the server also prove the connection is alive
+  ws.on("pong", () => {
     resetHeartbeat();
   });
 
@@ -122,7 +157,7 @@ function connectWs(endpoint) {
     }
   });
 
-  wsConnections.set(endpoint.name, { ws, heartbeatTimer });
+  wsConnections.set(endpoint.name, { ws, heartbeatTimer, pingTimer });
 }
 
 function handleDisconnect(endpoint, reason) {
@@ -160,12 +195,14 @@ function handleDisconnect(endpoint, reason) {
     data.reconnectHistory.shift();
   }
 
-  // Clean up
+  // Clean up timers
   const conn = wsConnections.get(endpoint.name);
   if (conn?.heartbeatTimer) clearTimeout(conn.heartbeatTimer);
+  if (conn?.pingTimer) clearInterval(conn.pingTimer);
 
-  // Attempt reconnect if under retry limit
+  // Attempt reconnect if under retry limit (exponential backoff)
   if (data._consecutiveConnectFailures < WS_MAX_RETRIES) {
+    const delay = Math.min(1000 * Math.pow(2, data._consecutiveConnectFailures - 1), 30000);
     setTimeout(() => {
       const reconnectStart = Date.now();
       connectWs(endpoint);
@@ -183,8 +220,26 @@ function handleDisconnect(endpoint, reason) {
 
       // Stop checking after 10 seconds
       setTimeout(() => clearInterval(checkConnected), 10000);
-    }, 1000);
+    }, delay);
   }
+}
+
+// Periodically recover dead connections that exhausted their retries
+function startRecoveryTimer() {
+  setInterval(() => {
+    for (const ep of RPC_ENDPOINTS) {
+      if (!ep.ws) continue;
+      const data = wsData.get(ep.name);
+      if (!data) continue;
+
+      // Only recover endpoints that have given up (hit max retries)
+      if (data._consecutiveConnectFailures >= WS_MAX_RETRIES && data.status === "disconnected") {
+        try { writeWsLog(ep.name, "recovery_attempt", null, `Retrying after ${WS_RECOVERY_INTERVAL / 1000}s cooldown`); } catch {}
+        data._consecutiveConnectFailures = 0;
+        connectWs(ep);
+      }
+    }
+  }, WS_RECOVERY_INTERVAL);
 }
 
 function updateUptimes() {
@@ -207,6 +262,9 @@ function startWsTesting() {
 
   // Periodically update uptime stats
   setInterval(updateUptimes, 5000);
+
+  // Periodically recover dead connections
+  startRecoveryTimer();
 }
 
 function getAllWsStatus() {
@@ -232,6 +290,7 @@ function getAllWsStatus() {
 function closeAllWs() {
   for (const [, conn] of wsConnections) {
     if (conn.heartbeatTimer) clearTimeout(conn.heartbeatTimer);
+    if (conn.pingTimer) clearInterval(conn.pingTimer);
     if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
       conn.ws.close(1000, "shutdown");
     }
