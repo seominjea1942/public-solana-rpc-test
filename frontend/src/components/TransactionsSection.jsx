@@ -145,15 +145,17 @@ export default function TransactionsSection() {
   const [stats, setStats] = useState(null);
   const [events, setEvents] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [txLimit, setTxLimit] = useState(30);
+  const [hasMore, setHasMore] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   const fetchData = useCallback(async () => {
     const period = PERIOD_OPTIONS[selectedPeriod];
     const poolParam = selectedPool ? `&pool=${selectedPool}` : "";
-    const poolQueryParam = selectedPool ? `?pool=${selectedPool}` : "";
 
     try {
       const [txRes, statsRes, eventsRes] = await Promise.all([
-        fetch(`/api/transactions/recent?limit=30${poolParam}`),
+        fetch(`/api/transactions/recent?limit=${txLimit}${poolParam}`),
         fetch(`/api/transactions/stats?period=${period.hours}${poolParam}`),
         fetch(`/api/events?limit=15`),
       ]);
@@ -162,14 +164,22 @@ export default function TransactionsSection() {
       const statsData = await statsRes.json();
       const eventsData = await eventsRes.json();
 
-      setTransactions(txData.transactions || []);
+      const txns = txData.transactions || [];
+      setTransactions(txns);
+      setHasMore(txns.length >= txLimit);
       setStats(statsData);
       setEvents(eventsData.events || []);
     } catch (err) {
       console.error("[TransactionsSection] fetch error:", err);
     } finally {
       setLoading(false);
+      setLoadingMore(false);
     }
+  }, [selectedPool, selectedPeriod, txLimit]);
+
+  // Reset limit when pool or period changes
+  useEffect(() => {
+    setTxLimit(30);
   }, [selectedPool, selectedPeriod]);
 
   useEffect(() => {
@@ -177,6 +187,11 @@ export default function TransactionsSection() {
     const interval = setInterval(fetchData, 15000);
     return () => clearInterval(interval);
   }, [fetchData]);
+
+  function loadMore() {
+    setLoadingMore(true);
+    setTxLimit((prev) => prev + 50);
+  }
 
   return (
     <div>
@@ -273,7 +288,7 @@ export default function TransactionsSection() {
               Recent Transactions
             </InfoTip>
             <span style={{ color: "#555", fontSize: 11, fontWeight: 400 }}>
-              {transactions.length} shown
+              {transactions.length}{hasMore ? "+" : ""} shown
             </span>
           </div>
 
@@ -322,7 +337,7 @@ export default function TransactionsSection() {
           </div>
 
           {/* Transaction rows */}
-          <div style={{ maxHeight: 400, overflow: "auto" }}>
+          <div style={{ maxHeight: 500, overflow: "auto" }}>
             {transactions.length === 0 && (
               <div style={{ padding: "20px 12px", color: "#444", fontSize: 12, textAlign: "center" }}>
                 {loading ? "Loading..." : "No transactions yet. Monitoring is running — data will appear as transactions are detected."}
@@ -357,6 +372,27 @@ export default function TransactionsSection() {
                 <EventBadge eventType={tx.eventType} />
               </div>
             ))}
+            {/* Load More button */}
+            {hasMore && transactions.length > 0 && (
+              <div style={{ padding: "10px 12px", textAlign: "center", borderTop: "1px solid #111" }}>
+                <button
+                  onClick={loadMore}
+                  disabled={loadingMore}
+                  style={{
+                    background: "#1a1a1a",
+                    border: "1px solid #333",
+                    borderRadius: 5,
+                    color: loadingMore ? "#555" : "#aaa",
+                    padding: "6px 20px",
+                    fontSize: 11,
+                    fontWeight: 600,
+                    cursor: loadingMore ? "default" : "pointer",
+                  }}
+                >
+                  {loadingMore ? "Loading..." : `Load More (showing ${transactions.length})`}
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
