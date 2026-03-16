@@ -1,5 +1,6 @@
 const WebSocket = require("ws");
 const { RPC_ENDPOINTS, TEST_ACCOUNT, WS_HEARTBEAT_TIMEOUT, WS_MAX_RETRIES } = require("./config");
+const { writeWsLog } = require("./database");
 
 // In-memory store for WS status
 const wsData = new Map();
@@ -9,7 +10,8 @@ function initWsData() {
   for (const ep of RPC_ENDPOINTS) {
     wsData.set(ep.name, {
       name: ep.name,
-      status: "disconnected",
+      wsSupported: !!ep.ws,
+      status: ep.ws ? "disconnected" : "unsupported",
       connectedAt: null,
       lastMessageAt: null,
       messageCount: 0,
@@ -52,6 +54,7 @@ function connectWs(endpoint) {
     if (heartbeatTimer) clearTimeout(heartbeatTimer);
     heartbeatTimer = setTimeout(() => {
       // No message for 30 seconds — connection is dead
+      try { writeWsLog(endpoint.name, "heartbeat_timeout", null, "No message for 30s"); } catch {}
       if (ws.readyState === WebSocket.OPEN) {
         ws.close(1000, "heartbeat timeout");
       }
@@ -63,6 +66,8 @@ function connectWs(endpoint) {
     data.connectedAt = Date.now();
     data._lastConnectedAt = Date.now();
     data._consecutiveConnectFailures = 0;
+
+    try { writeWsLog(endpoint.name, "connected", null, null); } catch {}
 
     // Subscribe to account updates
     ws.send(
@@ -110,6 +115,7 @@ function connectWs(endpoint) {
   });
 
   ws.on("error", (err) => {
+    try { writeWsLog(endpoint.name, "error", null, err.message); } catch {}
     // Error is usually followed by close, but handle it just in case
     if (ws.readyState !== WebSocket.CLOSED) {
       ws.close();
@@ -133,6 +139,10 @@ function handleDisconnect(endpoint, reason) {
   data.disconnectCount++;
   data.lastDisconnectReason = reason;
   data._consecutiveConnectFailures++;
+
+  // Log disconnect with connection duration
+  const connDuration = data._lastConnectedAt ? Date.now() - data._lastConnectedAt : null;
+  try { writeWsLog(endpoint.name, "disconnected", connDuration, reason); } catch {}
 
   // Update uptime
   const totalTime = Date.now() - data._startTime;
@@ -191,6 +201,7 @@ function updateUptimes() {
 
 function startWsTesting() {
   for (const ep of RPC_ENDPOINTS) {
+    if (!ep.ws) continue; // skip endpoints without WebSocket support
     connectWs(ep);
   }
 
@@ -203,6 +214,7 @@ function getAllWsStatus() {
   for (const [name, data] of wsData) {
     statuses.push({
       name,
+      wsSupported: data.wsSupported,
       status: data.status,
       connectedAt: data.connectedAt,
       lastMessageAt: data.lastMessageAt,

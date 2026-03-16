@@ -1,8 +1,11 @@
 const { RPC_ENDPOINTS, TEST_ACCOUNT, HTTP_TIMEOUT, FAILOVER_POLL_INTERVAL } = require("./config");
-const { getHealthiestEndpoint, getEndpointUrl } = require("./rpc-tester");
+const { getHealthiestEndpoint, getEndpointUrl, getAllStats, setCurrentPrimary } = require("./rpc-tester");
+const { getAllWsStatus } = require("./ws-tester");
+const { writeFailoverEvent } = require("./database");
 
 const failoverState = {
-  currentPrimary: null,
+  httpPrimary: null,
+  wsPrimary: null,
   failoverLog: [],
   totalFailovers: 0,
   totalRequests: 0,
@@ -46,16 +49,65 @@ async function simulateRequest(url) {
   }
 }
 
-async function failoverTick() {
-  // Pick the healthiest RPC
-  const healthiest = getHealthiestEndpoint();
+function pickBestWsPrimary() {
+  const wsStatuses = getAllWsStatus();
+  let best = null;
+  let bestScore = -Infinity;
 
-  // Initialize primary if not set
-  if (!failoverState.currentPrimary) {
-    failoverState.currentPrimary = healthiest || RPC_ENDPOINTS[0].name;
+  for (const ws of wsStatuses) {
+    if (!ws.wsSupported) continue;
+    if (ws.status !== "connected") continue;
+
+    // Score: uptime weight + message count as tiebreaker
+    const score = ws.connectionUptime * 100 + ws.messageCount * 0.01;
+    if (score > bestScore) {
+      bestScore = score;
+      best = ws.name;
+    }
   }
 
-  const primaryUrl = getEndpointUrl(failoverState.currentPrimary);
+  // If nothing is connected, pick the one with best uptime
+  if (!best) {
+    for (const ws of wsStatuses) {
+      if (!ws.wsSupported) continue;
+      const score = ws.connectionUptime;
+      if (score > bestScore) {
+        bestScore = score;
+        best = ws.name;
+      }
+    }
+  }
+
+  return best;
+}
+
+async function failoverTick() {
+  const healthiest = getHealthiestEndpoint();
+
+  // Initialize HTTP primary
+  if (!failoverState.httpPrimary) {
+    failoverState.httpPrimary = healthiest || RPC_ENDPOINTS[0].name;
+    setCurrentPrimary(failoverState.httpPrimary);
+  }
+
+  // Update WS primary
+  const bestWs = pickBestWsPrimary();
+  if (bestWs && bestWs !== failoverState.wsPrimary) {
+    if (failoverState.wsPrimary) {
+      const wsEvent = {
+        timestamp: Date.now(),
+        type: "ws",
+        from: failoverState.wsPrimary,
+        to: bestWs,
+        reason: "better WS connection available",
+      };
+      failoverState.failoverLog.push(wsEvent);
+      try { writeFailoverEvent(wsEvent); } catch {}
+    }
+    failoverState.wsPrimary = bestWs;
+  }
+
+  const primaryUrl = getEndpointUrl(failoverState.httpPrimary);
   if (!primaryUrl) return;
 
   failoverState.totalRequests++;
@@ -65,49 +117,42 @@ async function failoverTick() {
   if (result.success) {
     failoverState.successfulRequests++;
   } else {
-    // Primary failed — try to failover
-    if (healthiest && healthiest !== failoverState.currentPrimary) {
-      const from = failoverState.currentPrimary;
-      failoverState.currentPrimary = healthiest;
+    if (healthiest && healthiest !== failoverState.httpPrimary) {
+      const from = failoverState.httpPrimary;
+      const failoverStart = Date.now();
+      failoverState.httpPrimary = healthiest;
       failoverState.totalFailovers++;
 
-      const entry = {
-        timestamp: Date.now(),
-        from,
-        to: healthiest,
-        reason: result.reason || "request failed",
-      };
-      failoverState.failoverLog.push(entry);
+      // Update primary for rpc-tester DB tagging
+      setCurrentPrimary(healthiest);
 
-      // Keep only last 50 entries
-      if (failoverState.failoverLog.length > 50) {
-        failoverState.failoverLog.shift();
-      }
-
-      // Try again with new primary
       const retryUrl = getEndpointUrl(healthiest);
+      let recoveryTimeMs = null;
       if (retryUrl) {
         const retry = await simulateRequest(retryUrl);
         if (retry.success) {
           failoverState.successfulRequests++;
+          recoveryTimeMs = Date.now() - failoverStart;
         }
+      }
+
+      const httpEvent = {
+        timestamp: Date.now(),
+        type: "http",
+        from,
+        to: healthiest,
+        reason: result.reason || "request failed",
+        recovery_time_ms: recoveryTimeMs,
+      };
+      failoverState.failoverLog.push(httpEvent);
+      try { writeFailoverEvent(httpEvent); } catch {}
+
+      if (failoverState.failoverLog.length > 50) {
+        failoverState.failoverLog.shift();
       }
     }
   }
 
-  // Also check if healthiest has changed and current primary should be swapped proactively
-  if (
-    healthiest &&
-    healthiest !== failoverState.currentPrimary &&
-    result.success
-  ) {
-    // Current primary is still working, but a healthier option is available
-    // Only swap proactively if current primary is showing signs of degradation
-    const currentUrl = getEndpointUrl(failoverState.currentPrimary);
-    // Don't proactively swap to avoid flapping — only swap on failure
-  }
-
-  // Update uptime
   failoverState.uptimeWithFailover =
     failoverState.totalRequests > 0
       ? Math.round((failoverState.successfulRequests / failoverState.totalRequests) * 10000) / 100
@@ -119,8 +164,20 @@ function startFailoverSimulator() {
 }
 
 function getFailoverStatus() {
+  // Get current HTTP primary stats
+  const allStats = getAllStats();
+  const httpPrimaryStats = allStats.find((e) => e.name === failoverState.httpPrimary);
+
+  // Get current WS primary stats
+  const wsStatuses = getAllWsStatus();
+  const wsPrimaryStats = wsStatuses.find((w) => w.name === failoverState.wsPrimary);
+
   return {
-    currentPrimary: failoverState.currentPrimary,
+    httpPrimary: failoverState.httpPrimary,
+    httpPrimaryLatency: httpPrimaryStats?.stats?.avgLatency || null,
+    wsPrimary: failoverState.wsPrimary,
+    wsPrimaryUptime: wsPrimaryStats?.connectionUptime || null,
+    wsPrimaryConnectedAt: wsPrimaryStats?.connectedAt || null,
     failoverLog: failoverState.failoverLog,
     totalFailovers: failoverState.totalFailovers,
     totalRequests: failoverState.totalRequests,

@@ -1,4 +1,6 @@
-const { RPC_ENDPOINTS, TEST_ACCOUNT, HTTP_TIMEOUT, RESULTS_WINDOW } = require("./config");
+const { RPC_ENDPOINTS, TEST_ACCOUNT, HTTP_TIMEOUT, RESULTS_WINDOW, getNextPool } = require("./config");
+const { writeHealthCheck, writeRawAccountData, writeRawSlotData, writeParsedPoolData } = require("./database");
+const { parseRaydiumAmmV4 } = require("./pool-parser");
 
 // In-memory store: { [endpointName]: { results: [], stats: {} } }
 const endpointData = new Map();
@@ -54,15 +56,16 @@ async function rpcPost(url, method, params = []) {
   }
 }
 
-async function testEndpoint(endpoint) {
+async function testEndpoint(endpoint, pool) {
   const [healthResult, slotResult, accountResult] = await Promise.all([
     rpcPost(endpoint.http, "getHealth"),
     rpcPost(endpoint.http, "getSlot"),
-    rpcPost(endpoint.http, "getAccountInfo", [TEST_ACCOUNT, { encoding: "base64" }]),
+    rpcPost(endpoint.http, "getAccountInfo", [pool.address, { encoding: "base64" }]),
   ]);
 
   return {
     timestamp: Date.now(),
+    pool,
     getHealth: {
       latency: healthResult.latency,
       success: healthResult.success,
@@ -79,6 +82,8 @@ async function testEndpoint(endpoint) {
       success: accountResult.success,
       rateLimited: accountResult.rateLimited,
       dataSize: accountResult.data?.value?.data?.[0]?.length || 0,
+      // Keep raw response for DB storage
+      _rawResponse: accountResult,
     },
   };
 }
@@ -89,12 +94,14 @@ function computeStats(data) {
     return data.stats;
   }
 
-  // Collect all latencies from successful results
+  // Use last 60 results for stats (5-minute window)
+  const recentResults = results.slice(-60);
+
   const latencies = [];
   let successCount = 0;
   let totalTests = 0;
 
-  for (const r of results) {
+  for (const r of recentResults) {
     for (const test of ["getHealth", "getSlot", "getAccountInfo"]) {
       totalTests++;
       if (r[test].success) {
@@ -120,7 +127,6 @@ function computeStats(data) {
   const lastResult = results[results.length - 1];
   const currentSlot = lastResult.getSlot.slot || 0;
 
-  // Consecutive failures: count from most recent backward
   let consecutiveFailures = 0;
   for (let i = results.length - 1; i >= 0; i--) {
     const r = results[i];
@@ -132,7 +138,6 @@ function computeStats(data) {
     }
   }
 
-  // Health determination
   const isHealthy = !(
     consecutiveFailures >= 3 ||
     avgLatency > 2000 ||
@@ -145,7 +150,7 @@ function computeStats(data) {
     p99Latency,
     successRate,
     currentSlot,
-    slotDrift: data.stats.slotDrift, // updated separately
+    slotDrift: data.stats.slotDrift,
     isHealthy,
     consecutiveFailures,
   };
@@ -166,16 +171,24 @@ function updateSlotDrift() {
       ? maxSlot - data.stats.currentSlot
       : 0;
 
-    // Re-check health after slot drift update
     if (data.stats.slotDrift > 10) {
       data.stats.isHealthy = false;
     }
   }
 }
 
+// Track current primary for DB tagging
+let _currentPrimary = null;
+function setCurrentPrimary(name) {
+  _currentPrimary = name;
+}
+
 async function runHealthCheck() {
+  // Pick the pool for this cycle (all endpoints test the same pool)
+  const pool = getNextPool();
+
   const promises = RPC_ENDPOINTS.map(async (endpoint) => {
-    const result = await testEndpoint(endpoint);
+    const result = await testEndpoint(endpoint, pool);
     const data = endpointData.get(endpoint.name);
     if (!data) return;
 
@@ -185,6 +198,54 @@ async function runHealthCheck() {
     }
 
     computeStats(data);
+
+    // Write to SQLite
+    try {
+      const isPrimary = _currentPrimary === endpoint.name;
+      writeHealthCheck(endpoint.name, result, data.stats.slotDrift, isPrimary);
+
+      // Write raw slot data from all endpoints
+      if (result.getSlot.success && result.getSlot.slot) {
+        writeRawSlotData(endpoint.name, result.getSlot.slot);
+      }
+
+      // Write raw account data only from primary (avoid duplicates)
+      if (isPrimary && result.getAccountInfo._rawResponse) {
+        writeRawAccountData(
+          endpoint.name,
+          pool,
+          result.getAccountInfo._rawResponse
+        );
+
+        // Parse Raydium AMM v4 pool state (fire-and-forget)
+        if (pool.poolType === "AMM v4" && result.getAccountInfo._rawResponse.success) {
+          const rawBase64 = result.getAccountInfo._rawResponse.data?.value?.data?.[0];
+          const slot = result.getAccountInfo._rawResponse.data?.context?.slot;
+          if (rawBase64) {
+            parseRaydiumAmmV4(endpoint.http, rawBase64, slot)
+              .then((parsed) => {
+                try {
+                  writeParsedPoolData(pool.address, pool.label, parsed);
+                } catch (dbErr) {
+                  console.error("Parsed pool DB write error:", dbErr.message);
+                }
+              })
+              .catch((parseErr) => {
+                console.error("AMM v4 parse error:", parseErr.message);
+                try {
+                  writeParsedPoolData(pool.address, pool.label, {
+                    parseSuccess: false,
+                    error: parseErr.message,
+                  });
+                } catch {}
+              });
+          }
+        }
+      }
+    } catch (err) {
+      // Don't let DB errors crash health checks
+      console.error(`DB write error for ${endpoint.name}:`, err.message);
+    }
   });
 
   await Promise.all(promises);
@@ -194,11 +255,24 @@ async function runHealthCheck() {
 function getAllStats() {
   const stats = [];
   for (const [name, data] of endpointData) {
+    const ep = RPC_ENDPOINTS.find((e) => e.name === name);
+    const lastResult = data.results[data.results.length - 1] || null;
+    // Strip _rawResponse to avoid sending huge base64 data to frontend
+    let sanitizedResult = null;
+    if (lastResult) {
+      const { getAccountInfo, ...rest } = lastResult;
+      const { _rawResponse, ...acctRest } = getAccountInfo;
+      sanitizedResult = { ...rest, getAccountInfo: acctRest };
+    }
     stats.push({
       name,
       stats: data.stats,
-      latestResult: data.results[data.results.length - 1] || null,
+      latestResult: sanitizedResult,
       resultCount: data.results.length,
+      description: ep?.description || "",
+      details: ep?.details || null,
+      info: ep?.info || null,
+      wsSupported: !!ep?.ws,
     });
   }
   return stats;
@@ -211,7 +285,6 @@ function getHealthiestEndpoint() {
   for (const [name, data] of endpointData) {
     if (!data.stats.isHealthy) continue;
 
-    // Score: higher is better. Prioritize success rate, then latency
     const score = data.stats.successRate * 10 - data.stats.avgLatency - data.stats.slotDrift * 100;
     if (score > bestScore) {
       bestScore = score;
@@ -219,7 +292,6 @@ function getHealthiestEndpoint() {
     }
   }
 
-  // If nothing is healthy, return the one with fewest consecutive failures
   if (!best) {
     let minFailures = Infinity;
     for (const [name, data] of endpointData) {
@@ -238,21 +310,27 @@ function getEndpointUrl(name) {
   return ep ? ep.http : null;
 }
 
-function getLatencyHistory() {
+function getLatencyHistory(sinceMs) {
   const history = [];
-  // Build time-aligned series
+  const cutoff = sinceMs ? Date.now() - sinceMs : 0;
+
   for (const [name, data] of endpointData) {
     for (const r of data.results) {
-      const avgLatency = Math.round(
-        [r.getHealth.latency, r.getSlot.latency, r.getAccountInfo.latency]
-          .filter((l) => l > 0)
-          .reduce((a, b, _, arr) => a + b / arr.length, 0)
-      );
-      history.push({
-        name,
-        timestamp: r.timestamp,
-        avgLatency,
-      });
+      if (r.timestamp < cutoff) continue;
+
+      const successfulLatencies = [r.getHealth, r.getSlot, r.getAccountInfo]
+        .filter((t) => t.success)
+        .map((t) => t.latency);
+
+      if (successfulLatencies.length === 0) {
+        // Endpoint was DOWN — push null so frontend can show a gap
+        history.push({ name, timestamp: r.timestamp, avgLatency: null });
+      } else {
+        const avgLatency = Math.round(
+          successfulLatencies.reduce((a, b) => a + b, 0) / successfulLatencies.length
+        );
+        history.push({ name, timestamp: r.timestamp, avgLatency });
+      }
     }
   }
   return history;
@@ -265,5 +343,6 @@ module.exports = {
   getHealthiestEndpoint,
   getEndpointUrl,
   getLatencyHistory,
+  setCurrentPrimary,
   endpointData,
 };

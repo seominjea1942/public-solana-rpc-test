@@ -4,6 +4,9 @@ import StatusCards from "./components/StatusCards";
 import LatencyChart from "./components/LatencyChart";
 import WebSocketStatus from "./components/WebSocketStatus";
 import FailoverLog from "./components/FailoverLog";
+import EndpointRanking from "./components/EndpointRanking";
+import RawDataSection from "./components/RawDataSection";
+import ParsedPoolData from "./components/ParsedPoolData";
 
 function formatUptime(startTime) {
   const seconds = Math.floor((Date.now() - startTime) / 1000);
@@ -50,6 +53,9 @@ export default function App() {
   const wsStatus = data?.wsStatus || [];
   const latencyHistory = data?.latencyHistory || [];
   const heliusEnabled = data?.heliusEnabled;
+  const dbStats = data?.dbStats || null;
+  const pools = data?.pools || [];
+  const parsedPool = data?.parsedPool || null;
   const endpointNames = endpoints.map((e) => e.name);
 
   return (
@@ -90,13 +96,24 @@ export default function App() {
           </span>
           <span style={{ color: "#444" }}>|</span>
           <span style={{ color: "#666" }}>Running: {uptime}</span>
+          {dbStats?.collectingSince && (
+            <>
+              <span style={{ color: "#444" }}>|</span>
+              <span style={{ color: "#666" }}>
+                Data: {formatUptime(dbStats.collectingSince)}
+              </span>
+              <span style={{ color: "#555", fontSize: 11 }}>
+                ({(dbStats.healthChecks || 0).toLocaleString()} checks)
+              </span>
+            </>
+          )}
         </div>
       </div>
 
       {/* Section 1: Status Cards */}
       <div style={{ marginBottom: 28 }}>
         <SectionHeader title="RPC Status" />
-        <StatusCards endpoints={endpoints} currentPrimary={failover?.currentPrimary} />
+        <StatusCards endpoints={endpoints} wsStatus={wsStatus} failover={failover} />
       </div>
 
       {/* Section 2: Latency Chart */}
@@ -109,7 +126,7 @@ export default function App() {
           padding: 20,
         }}
       >
-        <SectionHeader title="Latency Over Time (last 5 min)" />
+        <SectionHeader title="Latency Over Time" />
         <LatencyChart latencyHistory={latencyHistory} endpointNames={endpointNames} />
       </div>
 
@@ -139,6 +156,48 @@ export default function App() {
       >
         <SectionHeader title="Failover Simulator" />
         <FailoverLog failover={failover} />
+      </div>
+
+      {/* Section 5: Endpoint Ranking */}
+      <div
+        style={{
+          marginBottom: 28,
+          background: "#111",
+          border: "1px solid #222",
+          borderRadius: 8,
+          padding: 20,
+        }}
+      >
+        <SectionHeader title="Endpoint Ranking" />
+        <EndpointRanking endpoints={endpoints} wsStatus={wsStatus} />
+      </div>
+
+      {/* Section 6: Parsed Pool Data (Raydium AMM v4) */}
+      <div
+        style={{
+          marginBottom: 28,
+          background: "#111",
+          border: "1px solid #222",
+          borderRadius: 8,
+          padding: 20,
+        }}
+      >
+        <SectionHeader title="Raydium AMM v4 — Parsed Pool State" />
+        <ParsedPoolData parsedPool={parsedPool} />
+      </div>
+
+      {/* Section 7: Raw Data */}
+      <div
+        style={{
+          marginBottom: 28,
+          background: "#111",
+          border: "1px solid #222",
+          borderRadius: 8,
+          padding: 20,
+        }}
+      >
+        <SectionHeader title="Raw Data Collection" />
+        <RawDataSection dbStats={dbStats} pools={pools} />
       </div>
     </div>
   );
