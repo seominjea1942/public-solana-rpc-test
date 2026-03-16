@@ -874,6 +874,24 @@ function getParsedHistory(poolAddress, hours) {
   };
 }
 
+// ── Failover event queries ──
+
+function getRecentFailoverEvents(limit) {
+  const rows = db.prepare(`
+    SELECT * FROM failover_events
+    ORDER BY timestamp DESC LIMIT ?
+  `).all(limit || 50);
+
+  return rows.map((r) => ({
+    timestamp: r.timestamp,
+    type: r.type || "http",
+    from: r.from_endpoint,
+    to: r.to_endpoint,
+    reason: r.reason,
+    recovery_time_ms: r.recovery_time_ms,
+  }));
+}
+
 // ── Transaction & event queries ──
 
 function getRecentTransactions(poolAddress, limit) {
@@ -1086,6 +1104,7 @@ module.exports = {
   getRecentTransactions,
   getTransactionStats,
   getRecentEvents,
+  getRecentFailoverEvents,
   getDbStats,
   cleanupOldData,
   closeDb,

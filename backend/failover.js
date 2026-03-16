@@ -1,7 +1,7 @@
 const { RPC_ENDPOINTS, TEST_ACCOUNT, HTTP_TIMEOUT, FAILOVER_POLL_INTERVAL } = require("./config");
 const { getHealthiestEndpoint, getEndpointUrl, getAllStats, setCurrentPrimary } = require("./rpc-tester");
 const { getAllWsStatus } = require("./ws-tester");
-const { writeFailoverEvent } = require("./database");
+const { writeFailoverEvent, getRecentFailoverEvents } = require("./database");
 
 const failoverState = {
   httpPrimary: null,
@@ -160,6 +160,19 @@ async function failoverTick() {
 }
 
 function startFailoverSimulator() {
+  // Restore persisted failover events from SQLite so they survive restarts
+  try {
+    const persisted = getRecentFailoverEvents(50);
+    if (persisted.length > 0) {
+      // persisted comes newest-first, reverse to chronological order
+      failoverState.failoverLog = persisted.reverse();
+      failoverState.totalFailovers = persisted.filter((e) => e.type === "http").length;
+      console.log(`  Restored ${persisted.length} failover events from database`);
+    }
+  } catch (err) {
+    console.error("  Failed to restore failover events:", err.message);
+  }
+
   failoverInterval = setInterval(failoverTick, FAILOVER_POLL_INTERVAL);
 }
 

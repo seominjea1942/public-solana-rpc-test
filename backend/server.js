@@ -10,7 +10,7 @@ const {
   DB_PATH, cleanupOldData, closeDb, aggregateUptimeSummary,
   getUptimeStats, generateReport, getRawLatest, getRawCompare, getRawHistory, getRawExportCsv,
   getParsedLatest, getParsedHistory, getRecentTransactions, getTransactionStats, getRecentEvents,
-  getDbStats,
+  getRecentFailoverEvents, getDbStats,
 } = require("./database");
 
 const app = express();
@@ -41,6 +41,11 @@ app.get("/api/stats", (req, res) => {
 
 app.get("/api/failover-log", (req, res) => {
   res.json(getFailoverStatus());
+});
+
+app.get("/api/failover/history", (req, res) => {
+  const limit = parseInt(req.query.limit) || 50;
+  res.json({ events: getRecentFailoverEvents(limit) });
 });
 
 app.get("/api/ws-status", (req, res) => {

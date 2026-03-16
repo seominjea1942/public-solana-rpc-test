@@ -1,4 +1,5 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
+import { createPortal } from "react-dom";
 
 const tooltipStyles = `
 .tooltip-wrapper {
@@ -29,10 +30,7 @@ const tooltipStyles = `
 }
 
 .tooltip-popup {
-  position: absolute;
-  bottom: calc(100% + 8px);
-  left: 50%;
-  transform: translateX(-50%);
+  position: fixed;
   background: #1a1a1a;
   border: 1px solid #333;
   border-radius: 6px;
@@ -41,87 +39,89 @@ const tooltipStyles = `
   font-weight: 400;
   line-height: 1.5;
   color: #ccc;
-  max-width: 280px;
-  width: max-content;
-  z-index: 1000;
+  min-width: 200px;
+  max-width: min(340px, calc(100vw - 24px));
+  z-index: 99999;
   pointer-events: none;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
-}
-
-.tooltip-popup::after {
-  content: "";
-  position: absolute;
-  top: 100%;
-  left: 50%;
-  transform: translateX(-50%);
-  border: 6px solid transparent;
-  border-top-color: #333;
-}
-
-.tooltip-popup::before {
-  content: "";
-  position: absolute;
-  top: 100%;
-  left: 50%;
-  transform: translateX(-50%);
-  border: 5px solid transparent;
-  border-top-color: #1a1a1a;
-  z-index: 1;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  white-space: pre-line;
+  word-wrap: break-word;
 }
 `;
 
-let stylesInjected = false;
+const STYLE_ID = "tooltip-styles";
 
 export default function Tooltip({ children, text, noUnderline }) {
   const [visible, setVisible] = useState(false);
-  const [flipped, setFlipped] = useState(false);
-  const popupRef = useRef(null);
+  const [pos, setPos] = useState({ top: -9999, left: -9999 });
   const wrapperRef = useRef(null);
+  const popupRef = useRef(null);
 
   useEffect(() => {
-    if (!stylesInjected) {
-      const style = document.createElement("style");
-      style.textContent = tooltipStyles;
-      document.head.appendChild(style);
-      stylesInjected = true;
+    // Use ID so HMR replaces the old style instead of duplicating
+    let el = document.getElementById(STYLE_ID);
+    if (!el) {
+      el = document.createElement("style");
+      el.id = STYLE_ID;
+      document.head.appendChild(el);
     }
+    el.textContent = tooltipStyles;
   }, []);
 
-  useEffect(() => {
-    if (visible && popupRef.current && wrapperRef.current) {
-      const rect = popupRef.current.getBoundingClientRect();
-      // If tooltip goes above viewport, flip to below
-      if (rect.top < 4) {
-        setFlipped(true);
-      } else {
-        setFlipped(false);
-      }
-    }
-  }, [visible]);
+  const reposition = useCallback(() => {
+    if (!popupRef.current || !wrapperRef.current) return;
 
-  const flippedStyle = flipped
-    ? {
-        bottom: "auto",
-        top: "calc(100% + 8px)",
-      }
-    : {};
+    const wrapperRect = wrapperRef.current.getBoundingClientRect();
+    const popupRect = popupRef.current.getBoundingClientRect();
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    let top = wrapperRect.top - popupRect.height - 8;
+    let left = wrapperRect.left + wrapperRect.width / 2 - popupRect.width / 2;
+
+    // If tooltip would go above viewport, flip below
+    if (top < 4) {
+      top = wrapperRect.bottom + 8;
+    }
+
+    // Keep within horizontal bounds
+    if (left < 8) left = 8;
+    if (left + popupRect.width > vw - 8) left = vw - popupRect.width - 8;
+
+    // Keep within vertical bounds
+    if (top + popupRect.height > vh - 8) {
+      top = vh - popupRect.height - 8;
+    }
+
+    setPos({ top, left });
+  }, []);
+
+  // Position after the popup renders so we can measure it
+  useEffect(() => {
+    if (visible) {
+      // Use rAF to ensure the popup is rendered before measuring
+      requestAnimationFrame(() => reposition());
+    }
+  }, [visible, reposition]);
 
   return (
     <span
       className="tooltip-wrapper"
       ref={wrapperRef}
       onMouseEnter={() => setVisible(true)}
-      onMouseLeave={() => {
-        setVisible(false);
-        setFlipped(false);
-      }}
+      onMouseLeave={() => setVisible(false)}
     >
       <span className={noUnderline ? undefined : "tooltip-term"}>{children}</span>
       <span className="tooltip-icon">?</span>
-      {visible && (
-        <span className="tooltip-popup" ref={popupRef} style={flippedStyle}>
+      {visible && createPortal(
+        <span
+          className="tooltip-popup"
+          ref={popupRef}
+          style={{ top: pos.top, left: pos.left }}
+        >
           {text}
-        </span>
+        </span>,
+        document.body
       )}
     </span>
   );
