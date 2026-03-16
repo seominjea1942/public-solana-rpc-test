@@ -1,0 +1,12 @@
+{
+  "name": "public-solana-rpc-test",
+  "version": "1.0.0",
+  "description": "Solana RPC Health Tester & Failover Experiment",
+  "scripts": {
+    "install:all": "cd backend && npm install && cd ../frontend && npm install",
+    "start:backend": "cd backend && node server.js",
+    "start:frontend": "cd frontend && npm run dev",
+    "start": "npm run start:backend & npm run start:frontend",
+    "dev": "npm run start"
+  }
+}
