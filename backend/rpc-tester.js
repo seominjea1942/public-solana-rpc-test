@@ -102,6 +102,9 @@ function computeStats(data) {
 
   for (const r of recentResults) {
     for (const test of ["getHealth", "getSlot", "getAccountInfo"]) {
+      // Skip rate-limited (429) responses — they don't indicate endpoint failure,
+      // just that we exceeded the rate limit. Don't count them for or against.
+      if (r[test].rateLimited) continue;
       totalTests++;
       if (r[test].success) {
         successCount++;
@@ -129,7 +132,9 @@ function computeStats(data) {
   let consecutiveFailures = 0;
   for (let i = results.length - 1; i >= 0; i--) {
     const r = results[i];
-    const allFailed = !r.getHealth.success && !r.getSlot.success && !r.getAccountInfo.success;
+    // Rate-limited (429) is not an endpoint failure — skip it
+    const allFailed = !r.getHealth.success && !r.getSlot.success && !r.getAccountInfo.success
+      && !r.getHealth.rateLimited && !r.getSlot.rateLimited && !r.getAccountInfo.rateLimited;
     if (allFailed) {
       consecutiveFailures++;
     } else {

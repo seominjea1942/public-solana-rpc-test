@@ -8,6 +8,7 @@ import EndpointRanking from "./components/EndpointRanking";
 import PipelineStatus from "./components/PipelineStatus";
 import RawDataSection from "./components/RawDataSection";
 import ParsedPoolData from "./components/ParsedPoolData";
+import TransactionsSection from "./components/TransactionsSection";
 
 function formatUptime(startTime) {
   const seconds = Math.floor((Date.now() - startTime) / 1000);
@@ -202,7 +203,21 @@ export default function App() {
         <ParsedPoolData parsedPool={parsedPool} />
       </div>
 
-      {/* Section 8: Raw Data */}
+      {/* Section 8: Transactions */}
+      <div
+        style={{
+          marginBottom: 28,
+          background: "#111",
+          border: "1px solid #222",
+          borderRadius: 8,
+          padding: 20,
+        }}
+      >
+        <SectionHeader title="Transaction Monitor" />
+        <TransactionsSection />
+      </div>
+
+      {/* Section 9: Raw Data */}
       <div
         style={{
           marginBottom: 28,

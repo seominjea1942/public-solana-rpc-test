@@ -9,7 +9,8 @@ const { startScheduler, stopScheduler, getSchedulerStatus } = require("./schedul
 const {
   DB_PATH, cleanupOldData, closeDb, aggregateUptimeSummary,
   getUptimeStats, generateReport, getRawLatest, getRawCompare, getRawHistory, getRawExportCsv,
-  getParsedLatest, getParsedHistory, getDbStats,
+  getParsedLatest, getParsedHistory, getRecentTransactions, getTransactionStats, getRecentEvents,
+  getDbStats,
 } = require("./database");
 
 const app = express();
@@ -121,6 +122,25 @@ app.get("/api/pools", (req, res) => {
 
 app.get("/api/pipeline/status", (req, res) => {
   res.json(getSchedulerStatus());
+});
+
+// ── Transaction / Events API ──
+
+app.get("/api/transactions/recent", (req, res) => {
+  const pool = req.query.pool || null;
+  const limit = parseInt(req.query.limit) || 20;
+  res.json({ transactions: getRecentTransactions(pool, limit) });
+});
+
+app.get("/api/transactions/stats", (req, res) => {
+  const pool = req.query.pool || null;
+  const period = parseFloat(req.query.period) || 1;
+  res.json(getTransactionStats(pool, period));
+});
+
+app.get("/api/events", (req, res) => {
+  const limit = parseInt(req.query.limit) || 20;
+  res.json({ events: getRecentEvents(limit) });
 });
 
 // SSE stream

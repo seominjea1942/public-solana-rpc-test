@@ -152,9 +152,47 @@ db.exec(`
     block_time INTEGER,
     slot INTEGER,
     tx_type TEXT DEFAULT 'unparsed',
+    side TEXT,
+    base_amount REAL,
+    quote_amount REAL,
+    usd_value REAL,
+    trader_wallet TEXT,
     fee INTEGER,
+    event_type TEXT,
+    event_severity TEXT,
     success INTEGER NOT NULL DEFAULT 1,
     error_message TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS pool_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    window_start INTEGER NOT NULL,
+    window_end INTEGER NOT NULL,
+    pool_address TEXT NOT NULL,
+    dex TEXT NOT NULL,
+    swap_count INTEGER DEFAULT 0,
+    buy_count INTEGER DEFAULT 0,
+    sell_count INTEGER DEFAULT 0,
+    volume_usd REAL DEFAULT 0,
+    unique_makers INTEGER DEFAULT 0,
+    whale_count INTEGER DEFAULT 0,
+    liquidity_add_count INTEGER DEFAULT 0,
+    liquidity_remove_count INTEGER DEFAULT 0,
+    largest_swap_usd REAL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS defi_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    pool_address TEXT NOT NULL,
+    pool_label TEXT,
+    dex TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    signature TEXT,
+    trader_wallet TEXT,
+    usd_value REAL,
+    description TEXT
   );
 `);
 
@@ -163,6 +201,13 @@ const colsToAdd = [
   ["raw_account_data", "dex", "TEXT"],
   ["raw_account_data", "pool_type", "TEXT"],
   ["raw_account_data", "program_id", "TEXT"],
+  ["pool_transactions", "side", "TEXT"],
+  ["pool_transactions", "base_amount", "REAL"],
+  ["pool_transactions", "quote_amount", "REAL"],
+  ["pool_transactions", "usd_value", "REAL"],
+  ["pool_transactions", "trader_wallet", "TEXT"],
+  ["pool_transactions", "event_type", "TEXT"],
+  ["pool_transactions", "event_severity", "TEXT"],
 ];
 for (const [table, col, type] of colsToAdd) {
   try {
@@ -189,6 +234,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_rl_ts ON rate_limit_log(timestamp);
   CREATE INDEX IF NOT EXISTS idx_pt_sig ON pool_transactions(signature);
   CREATE INDEX IF NOT EXISTS idx_pt_pool_ts ON pool_transactions(pool_address, timestamp);
+  CREATE INDEX IF NOT EXISTS idx_ps_pool_ts ON pool_stats(pool_address, window_start);
+  CREATE INDEX IF NOT EXISTS idx_de_ts ON defi_events(timestamp);
 `);
 
 // ── Prepared statements ──
@@ -257,8 +304,24 @@ const insertRateLimitLog = db.prepare(`
 const insertPoolTransaction = db.prepare(`
   INSERT OR IGNORE INTO pool_transactions
     (timestamp, pool_address, pool_label, dex, pool_type,
-     signature, block_time, slot, tx_type, fee, success, error_message)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     signature, block_time, slot, tx_type, side, base_amount, quote_amount,
+     usd_value, trader_wallet, fee, event_type, event_severity, success, error_message)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const insertPoolStats = db.prepare(`
+  INSERT INTO pool_stats
+    (window_start, window_end, pool_address, dex, swap_count, buy_count, sell_count,
+     volume_usd, unique_makers, whale_count, liquidity_add_count, liquidity_remove_count,
+     largest_swap_usd)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const insertDefiEvent = db.prepare(`
+  INSERT INTO defi_events
+    (timestamp, pool_address, pool_label, dex, event_type, severity, signature,
+     trader_wallet, usd_value, description)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 // ── Write helpers ──
@@ -387,8 +450,47 @@ function writePoolTransaction(tx) {
   insertPoolTransaction.run(
     tx.timestamp, tx.poolAddress, tx.poolLabel, tx.dex, tx.poolType,
     tx.signature, tx.blockTime || null, tx.slot || null,
-    tx.txType || "unparsed", tx.fee || null, tx.success,
-    tx.errorMessage || null
+    tx.txType || "unparsed", tx.side || null,
+    tx.baseAmount || null, tx.quoteAmount || null,
+    tx.usdValue || null, tx.traderWallet || null,
+    tx.fee || null, tx.eventType || null, tx.eventSeverity || null,
+    tx.success, tx.errorMessage || null
+  );
+}
+
+function writeDefiEvent(evt) {
+  insertDefiEvent.run(
+    evt.timestamp, evt.poolAddress, evt.poolLabel || null, evt.dex,
+    evt.eventType, evt.severity, evt.signature || null,
+    evt.traderWallet || null, evt.usdValue || null,
+    evt.description || null
+  );
+}
+
+function computePoolStats(poolAddress, dex, windowMinutes) {
+  const now = Date.now();
+  const windowStart = now - (windowMinutes || 5) * 60 * 1000;
+
+  const stats = db.prepare(`
+    SELECT
+      COUNT(CASE WHEN tx_type LIKE 'swap%' THEN 1 END) as swap_count,
+      COUNT(CASE WHEN side = 'buy' THEN 1 END) as buy_count,
+      COUNT(CASE WHEN side = 'sell' THEN 1 END) as sell_count,
+      COALESCE(SUM(CASE WHEN tx_type LIKE 'swap%' THEN usd_value ELSE 0 END), 0) as volume_usd,
+      COUNT(DISTINCT trader_wallet) as unique_makers,
+      COUNT(CASE WHEN event_type = 'whale' THEN 1 END) as whale_count,
+      COUNT(CASE WHEN tx_type = 'add_liquidity' THEN 1 END) as liq_add,
+      COUNT(CASE WHEN tx_type = 'remove_liquidity' THEN 1 END) as liq_remove,
+      COALESCE(MAX(CASE WHEN tx_type LIKE 'swap%' THEN usd_value END), 0) as largest_swap
+    FROM pool_transactions
+    WHERE pool_address = ? AND timestamp >= ?
+  `).get(poolAddress, windowStart);
+
+  insertPoolStats.run(
+    windowStart, now, poolAddress, dex || "Unknown",
+    stats.swap_count, stats.buy_count, stats.sell_count,
+    stats.volume_usd, stats.unique_makers, stats.whale_count,
+    stats.liq_add, stats.liq_remove, stats.largest_swap
   );
 }
 
@@ -772,6 +874,133 @@ function getParsedHistory(poolAddress, hours) {
   };
 }
 
+// ── Transaction & event queries ──
+
+function getRecentTransactions(poolAddress, limit) {
+  const query = poolAddress
+    ? db.prepare(`
+        SELECT * FROM pool_transactions
+        WHERE pool_address = ? AND success = 1
+        ORDER BY block_time DESC, timestamp DESC LIMIT ?
+      `)
+    : db.prepare(`
+        SELECT * FROM pool_transactions
+        WHERE success = 1
+        ORDER BY block_time DESC, timestamp DESC LIMIT ?
+      `);
+
+  const rows = poolAddress ? query.all(poolAddress, limit || 20) : query.all(limit || 20);
+
+  return rows.map((r) => ({
+    signature: r.signature,
+    timestamp: r.block_time ? r.block_time * 1000 : r.timestamp,
+    poolAddress: r.pool_address,
+    poolLabel: r.pool_label,
+    dex: r.dex,
+    txType: r.tx_type,
+    side: r.side,
+    baseAmount: r.base_amount,
+    quoteAmount: r.quote_amount,
+    usdValue: r.usd_value,
+    traderWallet: r.trader_wallet,
+    fee: r.fee,
+    eventType: r.event_type,
+    eventSeverity: r.event_severity,
+  }));
+}
+
+function getTransactionStats(poolAddress, periodHours) {
+  const since = Date.now() - (periodHours || 1) * 3600 * 1000;
+  // Use block_time (seconds) for filtering when available
+  const sinceSec = Math.floor(since / 1000);
+
+  const query = poolAddress
+    ? db.prepare(`
+        SELECT
+          COUNT(*) as total_count,
+          COUNT(CASE WHEN tx_type LIKE 'swap%' THEN 1 END) as swap_count,
+          COUNT(CASE WHEN side = 'buy' THEN 1 END) as buy_count,
+          COUNT(CASE WHEN side = 'sell' THEN 1 END) as sell_count,
+          COALESCE(SUM(CASE WHEN tx_type LIKE 'swap%' THEN usd_value ELSE 0 END), 0) as volume_usd,
+          COUNT(DISTINCT trader_wallet) as unique_makers,
+          COUNT(CASE WHEN event_type = 'whale' THEN 1 END) as whale_count,
+          COUNT(CASE WHEN tx_type = 'add_liquidity' THEN 1 END) as liq_add_count,
+          COUNT(CASE WHEN tx_type = 'remove_liquidity' THEN 1 END) as liq_remove_count,
+          COALESCE(MAX(CASE WHEN tx_type LIKE 'swap%' THEN usd_value END), 0) as largest_swap_usd
+        FROM pool_transactions
+        WHERE pool_address = ? AND success = 1
+          AND (block_time >= ? OR (block_time IS NULL AND timestamp >= ?))
+      `)
+    : db.prepare(`
+        SELECT
+          COUNT(*) as total_count,
+          COUNT(CASE WHEN tx_type LIKE 'swap%' THEN 1 END) as swap_count,
+          COUNT(CASE WHEN side = 'buy' THEN 1 END) as buy_count,
+          COUNT(CASE WHEN side = 'sell' THEN 1 END) as sell_count,
+          COALESCE(SUM(CASE WHEN tx_type LIKE 'swap%' THEN usd_value ELSE 0 END), 0) as volume_usd,
+          COUNT(DISTINCT trader_wallet) as unique_makers,
+          COUNT(CASE WHEN event_type = 'whale' THEN 1 END) as whale_count,
+          COUNT(CASE WHEN tx_type = 'add_liquidity' THEN 1 END) as liq_add_count,
+          COUNT(CASE WHEN tx_type = 'remove_liquidity' THEN 1 END) as liq_remove_count,
+          COALESCE(MAX(CASE WHEN tx_type LIKE 'swap%' THEN usd_value END), 0) as largest_swap_usd
+        FROM pool_transactions
+        WHERE success = 1
+          AND (block_time >= ? OR (block_time IS NULL AND timestamp >= ?))
+      `);
+
+  const stats = poolAddress
+    ? query.get(poolAddress, sinceSec, since)
+    : query.get(sinceSec, since);
+
+  return {
+    period: `${periodHours || 1}h`,
+    totalCount: stats.total_count,
+    swapCount: stats.swap_count,
+    buyCount: stats.buy_count,
+    sellCount: stats.sell_count,
+    volumeUsd: Math.round(stats.volume_usd * 100) / 100,
+    uniqueMakers: stats.unique_makers,
+    whaleCount: stats.whale_count,
+    liqAddCount: stats.liq_add_count,
+    liqRemoveCount: stats.liq_remove_count,
+    largestSwapUsd: Math.round(stats.largest_swap_usd * 100) / 100,
+  };
+}
+
+function getRecentEvents(limit) {
+  const rows = db.prepare(`
+    SELECT * FROM defi_events
+    ORDER BY timestamp DESC LIMIT ?
+  `).all(limit || 20);
+
+  return rows.map((r) => ({
+    timestamp: r.timestamp,
+    poolAddress: r.pool_address,
+    poolLabel: r.pool_label,
+    dex: r.dex,
+    eventType: r.event_type,
+    severity: r.severity,
+    signature: r.signature,
+    traderWallet: r.trader_wallet,
+    usdValue: r.usd_value,
+    description: r.description,
+  }));
+}
+
+/**
+ * Look up pool's baseMint and quoteMint from the latest parsed data.
+ * Used by tx-monitor to identify token balance changes in transactions.
+ */
+function getPoolMints(poolAddress) {
+  const row = db.prepare(`
+    SELECT base_mint, quote_mint, base_vault, quote_vault, base_decimal, quote_decimal
+    FROM parsed_pool_data
+    WHERE pool_address = ? AND parse_success = 1
+    ORDER BY timestamp DESC LIMIT 1
+  `).get(poolAddress);
+  return row || null;
+}
+
 function getDbStats() {
   const hcCount = db.prepare("SELECT COUNT(*) as cnt FROM health_checks").get().cnt;
   const radCount = db.prepare("SELECT COUNT(*) as cnt FROM raw_account_data").get().cnt;
@@ -815,8 +1044,10 @@ function cleanupOldData() {
   const slDeleted = db.prepare("DELETE FROM scheduler_log WHERE timestamp < ?").run(threeDaysAgo).changes;
   const rlDeleted = db.prepare("DELETE FROM rate_limit_log WHERE timestamp < ?").run(threeDaysAgo).changes;
   const ptDeleted = db.prepare("DELETE FROM pool_transactions WHERE timestamp < ?").run(threeDaysAgo).changes;
+  const psDeleted = db.prepare("DELETE FROM pool_stats WHERE window_start < ?").run(threeDaysAgo).changes;
+  const deDeleted = db.prepare("DELETE FROM defi_events WHERE timestamp < ?").run(threeDaysAgo).changes;
 
-  const totalDeleted = hcDeleted + radDeleted + rsdDeleted + ppdDeleted + slDeleted + rlDeleted + ptDeleted;
+  const totalDeleted = hcDeleted + radDeleted + rsdDeleted + ppdDeleted + slDeleted + rlDeleted + ptDeleted + psDeleted + deDeleted;
   if (totalDeleted > 0) {
     console.log(`  DB cleanup: removed ${hcDeleted} health_checks (>7d), ${radDeleted} raw_account (>3d), ${rsdDeleted} raw_slot (>3d), ${ppdDeleted} parsed_pool (>3d), ${slDeleted} scheduler_log (>3d), ${rlDeleted} rate_limit_log (>3d), ${ptDeleted} pool_tx (>3d)`);
     db.exec("VACUUM");
@@ -839,7 +1070,10 @@ module.exports = {
   writeSchedulerLog,
   writeRateLimitLog,
   writePoolTransaction,
+  writeDefiEvent,
+  computePoolStats,
   getKnownSignatures,
+  getPoolMints,
   aggregateUptimeSummary,
   getUptimeStats,
   generateReport,
@@ -849,6 +1083,9 @@ module.exports = {
   getRawExportCsv,
   getParsedLatest,
   getParsedHistory,
+  getRecentTransactions,
+  getTransactionStats,
+  getRecentEvents,
   getDbStats,
   cleanupOldData,
   closeDb,
