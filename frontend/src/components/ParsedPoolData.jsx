@@ -5,9 +5,10 @@ import {
   XAxis,
   YAxis,
   CartesianGrid,
-  Tooltip,
+  Tooltip as RechartsTooltip,
   ResponsiveContainer,
 } from "recharts";
+import InfoTip from "./Tooltip";
 
 function truncAddr(addr) {
   if (!addr) return "—";
@@ -44,6 +45,13 @@ const TIME_RANGES = [
   { label: "All", ms: 0 },
 ];
 
+const PRICE_CHANGE_HINTS = {
+  "5m": "Price change over the last 5 minutes. Useful for spotting very short-term volatility or sudden spikes.",
+  "1h": "Price change over the last 1 hour. Shows short-term momentum and recent trading activity direction.",
+  "6h": "Price change over the last 6 hours. Helps identify medium-term trends within the current trading session.",
+  "24h": "Price change over the last 24 hours. The standard benchmark for daily performance, similar to what you see on CoinGecko or CoinMarketCap.",
+};
+
 function PriceChange({ label, value }) {
   if (value == null) return null;
   const color = value > 0 ? "#22c55e" : value < 0 ? "#ef4444" : "#666";
@@ -51,7 +59,7 @@ function PriceChange({ label, value }) {
   return (
     <div style={{ textAlign: "center", minWidth: 60 }}>
       <div style={{ color: "#555", fontSize: 10, textTransform: "uppercase", marginBottom: 2 }}>
-        {label}
+        <InfoTip text={PRICE_CHANGE_HINTS[label] || `Price change over ${label}`}>{label}</InfoTip>
       </div>
       <div style={{ color, fontSize: 13, fontWeight: 600 }}>
         {sign}{value.toFixed(2)}%
@@ -60,10 +68,12 @@ function PriceChange({ label, value }) {
   );
 }
 
-function StatRow({ label, value, mono }) {
+function StatRow({ label, value, mono, hint }) {
   return (
-    <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid #1a1a1a" }}>
-      <span style={{ color: "#666", fontSize: 12 }}>{label}</span>
+    <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: "1px solid #1a1a1a", alignItems: "center" }}>
+      <span style={{ color: "#666", fontSize: 12 }}>
+        {hint ? <InfoTip text={hint}>{label}</InfoTip> : label}
+      </span>
       <span style={{ color: "#aaa", fontSize: 12, fontFamily: mono ? "monospace" : "inherit" }}>{value}</span>
     </div>
   );
@@ -118,7 +128,9 @@ export default function ParsedPoolData({ parsedPool }) {
       <div style={{ display: "flex", alignItems: "baseline", gap: 16, marginBottom: 16 }}>
         <div>
           <div style={{ color: "#555", fontSize: 11, textTransform: "uppercase", marginBottom: 2 }}>
-            SOL/USDC Price
+            <InfoTip text="The current price of 1 SOL in USDC, calculated directly from pool reserves (Quote USDC / Base SOL). This is the on-chain DEX price, which may differ slightly from centralized exchange prices.">
+              SOL/USDC Price
+            </InfoTip>
           </div>
           <div style={{ color: "#fff", fontSize: 28, fontWeight: 700, fontFamily: "monospace" }}>
             ${pool.price?.toFixed(4) || "—"}
@@ -179,7 +191,7 @@ export default function ParsedPoolData({ parsedPool }) {
                 domain={["auto", "auto"]}
                 tickFormatter={(v) => `$${v.toFixed(2)}`}
               />
-              <Tooltip
+              <RechartsTooltip
                 contentStyle={{ background: "#1a1a1a", border: "1px solid #333", borderRadius: 6, fontSize: 12 }}
                 labelFormatter={(t) => new Date(t).toLocaleString()}
                 formatter={(value) => [`$${value.toFixed(4)}`, "Price"]}
@@ -202,26 +214,83 @@ export default function ParsedPoolData({ parsedPool }) {
         {/* Amounts */}
         <div style={{ background: "#0d0d0d", border: "1px solid #1a1a1a", borderRadius: 6, padding: 12 }}>
           <div style={{ color: "#8b5cf6", fontSize: 11, fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
-            Pool Reserves
+            <InfoTip text="The actual token balances held inside this AMM liquidity pool. These reserves determine the exchange rate: when you swap, tokens move in/out of these reserves. The ratio of Base to Quote sets the price." noUnderline>
+              Pool Reserves
+            </InfoTip>
           </div>
-          <StatRow label="Base (SOL)" value={formatAmount(pool.baseAmount, 4)} mono />
-          <StatRow label="Quote (USDC)" value={formatAmount(pool.quoteAmount, 2)} mono />
-          <StatRow label="Liquidity" value={formatUsd(pool.liquidityUsd)} mono />
-          <StatRow label="Fee Rate" value={pool.feeRate != null ? `${(pool.feeRate * 100).toFixed(2)}%` : "—"} />
-          <StatRow label="Status" value={pool.status ?? "—"} />
+          <StatRow
+            label="Base (SOL)"
+            value={formatAmount(pool.baseAmount, 4)}
+            mono
+            hint="The amount of SOL tokens currently held in this pool's reserve vault. When someone buys SOL, this decreases; when someone sells SOL, this increases."
+          />
+          <StatRow
+            label="Quote (USDC)"
+            value={formatAmount(pool.quoteAmount, 2)}
+            mono
+            hint="The amount of USDC (a US dollar stablecoin) held in this pool's reserve vault. This is the other side of the trading pair. Price is calculated as Quote / Base."
+          />
+          <StatRow
+            label="Liquidity"
+            value={formatUsd(pool.liquidityUsd)}
+            mono
+            hint="Total Value Locked (TVL) — the combined USD value of both tokens in the pool. Higher liquidity means less price impact (slippage) when trading. Calculated as 2 x Quote amount."
+          />
+          <StatRow
+            label="Fee Rate"
+            value={pool.feeRate != null ? `${(pool.feeRate * 100).toFixed(2)}%` : "—"}
+            hint="The percentage fee charged on every swap through this pool. This fee is distributed to liquidity providers (LPs) as reward for providing their tokens to the pool."
+          />
+          <StatRow
+            label="Status"
+            value={pool.status ?? "—"}
+            hint="The pool's on-chain status flag. Status 6 means the pool is active and fully operational. Other values may indicate the pool is paused, disabled, or in a special state."
+          />
         </div>
 
         {/* Addresses */}
         <div style={{ background: "#0d0d0d", border: "1px solid #1a1a1a", borderRadius: 6, padding: 12 }}>
           <div style={{ color: "#8b5cf6", fontSize: 11, fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
-            Pool Accounts
+            <InfoTip text="On-chain Solana addresses that make up this pool. Each pool has token 'mints' (the token type definitions), 'vaults' (the accounts holding actual tokens), and a linked order book market." noUnderline>
+              Pool Accounts
+            </InfoTip>
           </div>
-          <StatRow label="Base Mint" value={truncAddr(pool.baseMint)} mono />
-          <StatRow label="Quote Mint" value={truncAddr(pool.quoteMint)} mono />
-          <StatRow label="LP Mint" value={truncAddr(pool.lpMint)} mono />
-          <StatRow label="Base Vault" value={truncAddr(pool.baseVault)} mono />
-          <StatRow label="Quote Vault" value={truncAddr(pool.quoteVault)} mono />
-          <StatRow label="Market ID" value={truncAddr(pool.marketId)} mono />
+          <StatRow
+            label="Base Mint"
+            value={truncAddr(pool.baseMint)}
+            mono
+            hint="The token contract address (mint) for the base token (SOL). On Solana, every token type has a unique 'mint' address that identifies it. This is like the token's ID card."
+          />
+          <StatRow
+            label="Quote Mint"
+            value={truncAddr(pool.quoteMint)}
+            mono
+            hint="The token contract address (mint) for the quote token (USDC). The quote token is what the base token is priced in — similar to how stocks are priced in USD."
+          />
+          <StatRow
+            label="LP Mint"
+            value={truncAddr(pool.lpMint)}
+            mono
+            hint="The mint address for LP (Liquidity Provider) tokens. When you deposit tokens into the pool, you receive LP tokens as a receipt. They represent your share of the pool."
+          />
+          <StatRow
+            label="Base Vault"
+            value={truncAddr(pool.baseVault)}
+            mono
+            hint="The on-chain token account that physically holds the pool's SOL reserves. We query this vault's balance to know exactly how much SOL the pool contains right now."
+          />
+          <StatRow
+            label="Quote Vault"
+            value={truncAddr(pool.quoteVault)}
+            mono
+            hint="The on-chain token account that physically holds the pool's USDC reserves. We query this vault's balance along with the base vault to calculate the current price."
+          />
+          <StatRow
+            label="Market ID"
+            value={truncAddr(pool.marketId)}
+            mono
+            hint="The OpenBook (formerly Serum) order book market linked to this AMM. Raydium AMM v4 pairs with an on-chain order book for additional liquidity and tighter spreads."
+          />
         </div>
       </div>
 
@@ -238,15 +307,18 @@ export default function ParsedPoolData({ parsedPool }) {
         }}
       >
         <span>
-          Last parsed: <span style={{ color: "#aaa" }}>{formatTime(pool.timestamp)}</span>
+          <InfoTip text="When this pool data was last decoded from its raw on-chain account data. The parser runs every ~20 seconds when the AMM v4 pool comes up in the rotation cycle.">Last parsed</InfoTip>:{" "}
+          <span style={{ color: "#aaa" }}>{formatTime(pool.timestamp)}</span>
         </span>
         <span>
-          Slot: <span style={{ color: "#aaa", fontFamily: "monospace" }}>{pool.slot?.toLocaleString() || "—"}</span>
+          <InfoTip text="The Solana blockchain slot number when this data was read. Solana produces ~2.5 slots/sec. Slots are like block numbers — they tell you exactly which point in time the data comes from.">Slot</InfoTip>:{" "}
+          <span style={{ color: "#aaa", fontFamily: "monospace" }}>{pool.slot?.toLocaleString() || "—"}</span>
         </span>
         {pool.parseStats && (
           <>
             <span>
-              Parses: <span style={{ color: "#aaa" }}>{pool.parseStats.total}</span>
+              <InfoTip text="How many times we've successfully decoded the raw pool data. Parse failures can happen if the account data format is unexpected or an RPC call fails. A high success rate means the data pipeline is healthy.">Parses</InfoTip>:{" "}
+              <span style={{ color: "#aaa" }}>{pool.parseStats.total}</span>
               {" "}({pool.parseStats.successRate}% success)
             </span>
           </>

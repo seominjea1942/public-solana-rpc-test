@@ -2,9 +2,10 @@ const express = require("express");
 const cors = require("cors");
 const path = require("path");
 const { RPC_ENDPOINTS, HEALTH_CHECK_INTERVAL, HELIUS_API_KEY, POOL_ACCOUNTS } = require("./config");
-const { initEndpointData, runHealthCheck, getAllStats, getLatencyHistory } = require("./rpc-tester");
+const { initEndpointData, runHealthCheck, getAllStats, getLatencyHistory, getHealthiestEndpoint, getEndpointUrl } = require("./rpc-tester");
 const { initWsData, startWsTesting, getAllWsStatus, closeAllWs } = require("./ws-tester");
 const { startFailoverSimulator, getFailoverStatus, stopFailoverSimulator } = require("./failover");
+const { startScheduler, stopScheduler, getSchedulerStatus } = require("./scheduler");
 const {
   DB_PATH, cleanupOldData, closeDb, aggregateUptimeSummary,
   getUptimeStats, generateReport, getRawLatest, getRawCompare, getRawHistory, getRawExportCsv,
@@ -116,6 +117,12 @@ app.get("/api/pools", (req, res) => {
   res.json({ pools: POOL_ACCOUNTS });
 });
 
+// ── Pipeline / Scheduler API ──
+
+app.get("/api/pipeline/status", (req, res) => {
+  res.json(getSchedulerStatus());
+});
+
 // SSE stream
 app.get("/api/stream", (req, res) => {
   res.writeHead(200, {
@@ -148,6 +155,7 @@ function buildUpdatePayload() {
     dbStats: getDbStats(),
     pools: POOL_ACCOUNTS,
     parsedPool: getParsedLatest(),
+    pipeline: getSchedulerStatus(),
   };
 }
 
@@ -210,6 +218,13 @@ async function start() {
   console.log("Starting failover simulator (every 2s)...");
   startFailoverSimulator();
 
+  // Start staggered pipeline scheduler (Part A: pool state, Part B: tx monitor)
+  console.log("Starting pipeline scheduler (30s cycles, 8 tasks)...");
+  startScheduler(() => {
+    const name = getHealthiestEndpoint();
+    return name ? getEndpointUrl(name) : RPC_ENDPOINTS[0].http;
+  });
+
   // Start uptime_summary aggregation every 5 minutes
   console.log("Starting uptime aggregation (every 5m)...");
   const FIVE_MINUTES = 5 * 60 * 1000;
@@ -243,6 +258,7 @@ function shutdown() {
 
   if (healthCheckInterval) clearInterval(healthCheckInterval);
   if (aggregationInterval) clearInterval(aggregationInterval);
+  stopScheduler();
   stopFailoverSimulator();
   closeAllWs();
 

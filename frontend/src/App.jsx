@@ -5,6 +5,7 @@ import LatencyChart from "./components/LatencyChart";
 import WebSocketStatus from "./components/WebSocketStatus";
 import FailoverLog from "./components/FailoverLog";
 import EndpointRanking from "./components/EndpointRanking";
+import PipelineStatus from "./components/PipelineStatus";
 import RawDataSection from "./components/RawDataSection";
 import ParsedPoolData from "./components/ParsedPoolData";
 
@@ -56,6 +57,7 @@ export default function App() {
   const dbStats = data?.dbStats || null;
   const pools = data?.pools || [];
   const parsedPool = data?.parsedPool || null;
+  const pipeline = data?.pipeline || null;
   const endpointNames = endpoints.map((e) => e.name);
 
   return (
@@ -172,7 +174,21 @@ export default function App() {
         <EndpointRanking endpoints={endpoints} wsStatus={wsStatus} />
       </div>
 
-      {/* Section 6: Parsed Pool Data (Raydium AMM v4) */}
+      {/* Section 6: Pipeline Status */}
+      <div
+        style={{
+          marginBottom: 28,
+          background: "#111",
+          border: "1px solid #222",
+          borderRadius: 8,
+          padding: 20,
+        }}
+      >
+        <SectionHeader title="Pipeline Status" />
+        <PipelineStatus pipeline={pipeline} />
+      </div>
+
+      {/* Section 7: Parsed Pool Data (Raydium AMM v4) */}
       <div
         style={{
           marginBottom: 28,
@@ -186,7 +202,7 @@ export default function App() {
         <ParsedPoolData parsedPool={parsedPool} />
       </div>
 
-      {/* Section 7: Raw Data */}
+      {/* Section 8: Raw Data */}
       <div
         style={{
           marginBottom: 28,

@@ -1,5 +1,5 @@
 const { LIQUIDITY_STATE_LAYOUT_V4 } = require("@raydium-io/raydium-sdk");
-const { HTTP_TIMEOUT } = require("./config");
+const { rateLimitedRpcPost } = require("./rate-limiter");
 
 /**
  * Decode Raydium AMM v4 pool state from raw base64 account data.
@@ -14,36 +14,21 @@ function decodeAmmV4(base64Data) {
 }
 
 /**
- * Fetch token account balance via JSON-RPC getTokenAccountBalance.
+ * Fetch token account balance via rate-limited JSON-RPC call.
+ * Goes through the global rate limiter before hitting the RPC.
  */
 async function getTokenAccountBalance(rpcUrl, vaultAddress) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), HTTP_TIMEOUT);
-
-  try {
-    const res = await fetch(rpcUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "getTokenAccountBalance",
-        params: [vaultAddress],
-      }),
-      signal: controller.signal,
-    });
-    const data = await res.json();
-    if (data.error) throw new Error(data.error.message);
-    return data.result.value;
-  } finally {
-    clearTimeout(timeout);
+  const result = await rateLimitedRpcPost(rpcUrl, "getTokenAccountBalance", [vaultAddress]);
+  if (!result.success) {
+    throw new Error(result.error || "Failed to get token account balance");
   }
+  return result.data.value;
 }
 
 /**
  * Full parse pipeline for Raydium AMM v4:
- *  1. Decode binary layout → structured fields
- *  2. Query vault balances (2 RPC calls)
+ *  1. Decode binary layout -> structured fields
+ *  2. Query vault balances (2 rate-limited RPC calls)
  *  3. Calculate price = quoteAmount / baseAmount
  *
  * @param {string} rpcUrl - RPC endpoint to query vault balances
@@ -73,7 +58,7 @@ async function parseRaydiumAmmV4(rpcUrl, base64Data, slot) {
   const openOrders = poolState.openOrders.toBase58();
   const marketId = poolState.marketId.toBase58();
 
-  // Fetch vault balances (2 parallel RPC calls)
+  // Fetch vault balances (2 parallel rate-limited RPC calls)
   const [baseBalance, quoteBalance] = await Promise.all([
     getTokenAccountBalance(rpcUrl, baseVault),
     getTokenAccountBalance(rpcUrl, quoteVault),
@@ -85,7 +70,7 @@ async function parseRaydiumAmmV4(rpcUrl, base64Data, slot) {
   // Price = quote / base (e.g. USDC per SOL)
   const price = baseAmount > 0 ? quoteAmount / baseAmount : 0;
 
-  // Total liquidity ≈ quote × 2 (balanced AMM pool)
+  // Total liquidity ~= quote x 2 (balanced AMM pool)
   const liquidityUsd = quoteAmount * 2;
 
   return {

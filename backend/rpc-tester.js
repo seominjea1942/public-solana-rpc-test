@@ -1,6 +1,5 @@
 const { RPC_ENDPOINTS, TEST_ACCOUNT, HTTP_TIMEOUT, RESULTS_WINDOW, getNextPool } = require("./config");
-const { writeHealthCheck, writeRawAccountData, writeRawSlotData, writeParsedPoolData } = require("./database");
-const { parseRaydiumAmmV4 } = require("./pool-parser");
+const { writeHealthCheck, writeRawAccountData, writeRawSlotData } = require("./database");
 
 // In-memory store: { [endpointName]: { results: [], stats: {} } }
 const endpointData = new Map();
@@ -210,37 +209,13 @@ async function runHealthCheck() {
       }
 
       // Write raw account data only from primary (avoid duplicates)
+      // Note: Pool parsing (Part A) is now handled by the scheduler module
       if (isPrimary && result.getAccountInfo._rawResponse) {
         writeRawAccountData(
           endpoint.name,
           pool,
           result.getAccountInfo._rawResponse
         );
-
-        // Parse Raydium AMM v4 pool state (fire-and-forget)
-        if (pool.poolType === "AMM v4" && result.getAccountInfo._rawResponse.success) {
-          const rawBase64 = result.getAccountInfo._rawResponse.data?.value?.data?.[0];
-          const slot = result.getAccountInfo._rawResponse.data?.context?.slot;
-          if (rawBase64) {
-            parseRaydiumAmmV4(endpoint.http, rawBase64, slot)
-              .then((parsed) => {
-                try {
-                  writeParsedPoolData(pool.address, pool.label, parsed);
-                } catch (dbErr) {
-                  console.error("Parsed pool DB write error:", dbErr.message);
-                }
-              })
-              .catch((parseErr) => {
-                console.error("AMM v4 parse error:", parseErr.message);
-                try {
-                  writeParsedPoolData(pool.address, pool.label, {
-                    parseSuccess: false,
-                    error: parseErr.message,
-                  });
-                } catch {}
-              });
-          }
-        }
       }
     } catch (err) {
       // Don't let DB errors crash health checks

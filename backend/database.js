@@ -118,6 +118,44 @@ db.exec(`
     parse_success INTEGER NOT NULL,
     error_message TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS scheduler_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    task TEXT NOT NULL,
+    pool_address TEXT NOT NULL,
+    pool_label TEXT NOT NULL,
+    duration_ms INTEGER,
+    rpc_calls_made INTEGER,
+    items_processed INTEGER,
+    success INTEGER NOT NULL,
+    error TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS rate_limit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    requests_per_sec REAL,
+    tokens_remaining REAL,
+    was_throttled INTEGER NOT NULL DEFAULT 0,
+    got_429 INTEGER NOT NULL DEFAULT 0
+  );
+
+  CREATE TABLE IF NOT EXISTS pool_transactions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    pool_address TEXT NOT NULL,
+    pool_label TEXT,
+    dex TEXT,
+    pool_type TEXT,
+    signature TEXT NOT NULL UNIQUE,
+    block_time INTEGER,
+    slot INTEGER,
+    tx_type TEXT DEFAULT 'unparsed',
+    fee INTEGER,
+    success INTEGER NOT NULL DEFAULT 1,
+    error_message TEXT
+  );
 `);
 
 // ── Schema migration: add new columns to existing tables ──
@@ -147,6 +185,10 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_rsd_ts ON raw_slot_data(timestamp);
   CREATE INDEX IF NOT EXISTS idx_ppd_ts ON parsed_pool_data(timestamp);
   CREATE INDEX IF NOT EXISTS idx_ppd_addr_ts ON parsed_pool_data(pool_address, timestamp);
+  CREATE INDEX IF NOT EXISTS idx_sl_ts ON scheduler_log(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_rl_ts ON rate_limit_log(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_pt_sig ON pool_transactions(signature);
+  CREATE INDEX IF NOT EXISTS idx_pt_pool_ts ON pool_transactions(pool_address, timestamp);
 `);
 
 // ── Prepared statements ──
@@ -198,6 +240,25 @@ const insertParsedPoolData = db.prepare(`
      price, liquidity_usd, fee_rate, status, lp_reserve,
      open_orders, market_id, slot, parse_success, error_message)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const insertSchedulerLog = db.prepare(`
+  INSERT INTO scheduler_log
+    (timestamp, task, pool_address, pool_label, duration_ms, rpc_calls_made, items_processed, success, error)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const insertRateLimitLog = db.prepare(`
+  INSERT INTO rate_limit_log
+    (timestamp, requests_per_sec, tokens_remaining, was_throttled, got_429)
+  VALUES (?, ?, ?, ?, ?)
+`);
+
+const insertPoolTransaction = db.prepare(`
+  INSERT OR IGNORE INTO pool_transactions
+    (timestamp, pool_address, pool_label, dex, pool_type,
+     signature, block_time, slot, tx_type, fee, success, error_message)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 // ── Write helpers ──
@@ -305,6 +366,43 @@ function writeParsedPoolData(poolAddress, poolLabel, parsed) {
       0, parsed.error || "unknown error"
     );
   }
+}
+
+function writeSchedulerLog(entry) {
+  insertSchedulerLog.run(
+    entry.timestamp, entry.task, entry.poolAddress, entry.poolLabel,
+    entry.durationMs || null, entry.rpcCallsMade || 0, entry.itemsProcessed || 0,
+    entry.success, entry.error || null
+  );
+}
+
+function writeRateLimitLog(entry) {
+  insertRateLimitLog.run(
+    entry.timestamp, entry.requestsPerSec, entry.tokensRemaining,
+    entry.wasThrottled, entry.got429
+  );
+}
+
+function writePoolTransaction(tx) {
+  insertPoolTransaction.run(
+    tx.timestamp, tx.poolAddress, tx.poolLabel, tx.dex, tx.poolType,
+    tx.signature, tx.blockTime || null, tx.slot || null,
+    tx.txType || "unparsed", tx.fee || null, tx.success,
+    tx.errorMessage || null
+  );
+}
+
+/**
+ * Return the set of signatures we already have for a pool.
+ * Used by tx-monitor to avoid re-fetching known transactions.
+ */
+function getKnownSignatures(poolAddress, signatures) {
+  if (!signatures || signatures.length === 0) return new Set();
+  const placeholders = signatures.map(() => "?").join(",");
+  const rows = db.prepare(
+    `SELECT signature FROM pool_transactions WHERE pool_address = ? AND signature IN (${placeholders})`
+  ).all(poolAddress, ...signatures);
+  return new Set(rows.map((r) => r.signature));
 }
 
 // ── Aggregation: uptime_summary every 5 minutes ──
@@ -679,6 +777,8 @@ function getDbStats() {
   const radCount = db.prepare("SELECT COUNT(*) as cnt FROM raw_account_data").get().cnt;
   const foCount = db.prepare("SELECT COUNT(*) as cnt FROM failover_events").get().cnt;
   const wsCount = db.prepare("SELECT COUNT(*) as cnt FROM ws_connection_log").get().cnt;
+  const slCount = db.prepare("SELECT COUNT(*) as cnt FROM scheduler_log").get().cnt;
+  const ptCount = db.prepare("SELECT COUNT(*) as cnt FROM pool_transactions").get().cnt;
   const firstHc = db.prepare("SELECT MIN(timestamp) as ts FROM health_checks").get().ts;
 
   // Get file size
@@ -693,6 +793,8 @@ function getDbStats() {
     rawAccountData: radCount,
     failoverEvents: foCount,
     wsLogs: wsCount,
+    schedulerLogs: slCount,
+    poolTransactions: ptCount,
     collectingSince: firstHc || null,
     dbSizeBytes: fileSize,
     dbSizeMB: Math.round((fileSize / 1024 / 1024) * 10) / 10,
@@ -710,9 +812,13 @@ function cleanupOldData() {
   const radDeleted = db.prepare("DELETE FROM raw_account_data WHERE timestamp < ?").run(threeDaysAgo).changes;
   const rsdDeleted = db.prepare("DELETE FROM raw_slot_data WHERE timestamp < ?").run(threeDaysAgo).changes;
   const ppdDeleted = db.prepare("DELETE FROM parsed_pool_data WHERE timestamp < ?").run(threeDaysAgo).changes;
+  const slDeleted = db.prepare("DELETE FROM scheduler_log WHERE timestamp < ?").run(threeDaysAgo).changes;
+  const rlDeleted = db.prepare("DELETE FROM rate_limit_log WHERE timestamp < ?").run(threeDaysAgo).changes;
+  const ptDeleted = db.prepare("DELETE FROM pool_transactions WHERE timestamp < ?").run(threeDaysAgo).changes;
 
-  if (hcDeleted > 0 || radDeleted > 0 || rsdDeleted > 0 || ppdDeleted > 0) {
-    console.log(`  DB cleanup: removed ${hcDeleted} health_checks (>7d), ${radDeleted} raw_account_data (>3d), ${rsdDeleted} raw_slot_data (>3d), ${ppdDeleted} parsed_pool_data (>3d)`);
+  const totalDeleted = hcDeleted + radDeleted + rsdDeleted + ppdDeleted + slDeleted + rlDeleted + ptDeleted;
+  if (totalDeleted > 0) {
+    console.log(`  DB cleanup: removed ${hcDeleted} health_checks (>7d), ${radDeleted} raw_account (>3d), ${rsdDeleted} raw_slot (>3d), ${ppdDeleted} parsed_pool (>3d), ${slDeleted} scheduler_log (>3d), ${rlDeleted} rate_limit_log (>3d), ${ptDeleted} pool_tx (>3d)`);
     db.exec("VACUUM");
   }
 }
@@ -730,6 +836,10 @@ module.exports = {
   writeRawAccountData,
   writeRawSlotData,
   writeParsedPoolData,
+  writeSchedulerLog,
+  writeRateLimitLog,
+  writePoolTransaction,
+  getKnownSignatures,
   aggregateUptimeSummary,
   getUptimeStats,
   generateReport,
