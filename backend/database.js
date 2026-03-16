@@ -194,6 +194,21 @@ db.exec(`
     usd_value REAL,
     description TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS price_validations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp INTEGER NOT NULL,
+    pool_address TEXT NOT NULL,
+    dex TEXT NOT NULL,
+    pool_type TEXT,
+    our_price REAL,
+    reference_price REAL,
+    difference_pct REAL,
+    status TEXT NOT NULL,
+    reference_source TEXT DEFAULT 'dexscreener',
+    reference_dex TEXT,
+    detail TEXT
+  );
 `);
 
 // ── Schema migration: add new columns to existing tables ──
@@ -236,6 +251,9 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_pt_pool_ts ON pool_transactions(pool_address, timestamp);
   CREATE INDEX IF NOT EXISTS idx_ps_pool_ts ON pool_stats(pool_address, window_start);
   CREATE INDEX IF NOT EXISTS idx_de_ts ON defi_events(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_pv_ts ON price_validations(timestamp);
+  CREATE INDEX IF NOT EXISTS idx_pv_pool ON price_validations(pool_address, timestamp);
+  CREATE INDEX IF NOT EXISTS idx_pv_status ON price_validations(status, timestamp);
 `);
 
 // ── Prepared statements ──
@@ -322,6 +340,13 @@ const insertDefiEvent = db.prepare(`
     (timestamp, pool_address, pool_label, dex, event_type, severity, signature,
      trader_wallet, usd_value, description)
   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`);
+
+const insertPriceValidation = db.prepare(`
+  INSERT INTO price_validations
+    (timestamp, pool_address, dex, pool_type, our_price, reference_price,
+     difference_pct, status, reference_source, reference_dex, detail)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 // ── Write helpers ──
@@ -464,6 +489,16 @@ function writeDefiEvent(evt) {
     evt.eventType, evt.severity, evt.signature || null,
     evt.traderWallet || null, evt.usdValue || null,
     evt.description || null
+  );
+}
+
+function writePriceValidation(v) {
+  insertPriceValidation.run(
+    v.timestamp, v.poolAddress, v.dex, v.poolType || null,
+    v.ourPrice || null, v.referencePrice || null,
+    v.differencePct != null ? v.differencePct : null,
+    v.status, v.referenceSource || "dexscreener",
+    v.referenceDex || null, v.detail || null
   );
 }
 
@@ -892,6 +927,83 @@ function getRecentFailoverEvents(limit) {
   }));
 }
 
+// ── Price validation queries ──
+
+function getLatestValidations() {
+  // Get latest validation per pool
+  const rows = db.prepare(`
+    SELECT pv.* FROM price_validations pv
+    INNER JOIN (
+      SELECT pool_address, MAX(timestamp) as max_ts
+      FROM price_validations
+      GROUP BY pool_address
+    ) latest ON pv.pool_address = latest.pool_address AND pv.timestamp = latest.max_ts
+    ORDER BY pv.pool_address
+  `).all();
+
+  // Get summary stats (all time)
+  const summary = db.prepare(`
+    SELECT
+      COUNT(*) as total_checks,
+      COUNT(CASE WHEN status = 'pass' THEN 1 END) as passes,
+      COUNT(CASE WHEN status = 'warning' THEN 1 END) as warnings,
+      COUNT(CASE WHEN status = 'fail' THEN 1 END) as fails,
+      COUNT(CASE WHEN status = 'skip' THEN 1 END) as skips
+    FROM price_validations
+  `).get();
+
+  const totalNonSkip = summary.passes + summary.warnings + summary.fails;
+  const accuracy = totalNonSkip > 0
+    ? Math.round((summary.passes / totalNonSkip) * 1000) / 10
+    : 100;
+
+  return {
+    validations: rows.map((r) => ({
+      poolAddress: r.pool_address,
+      dex: r.dex,
+      poolType: r.pool_type,
+      ourPrice: r.our_price,
+      referencePrice: r.reference_price,
+      differencePct: r.difference_pct,
+      status: r.status,
+      referenceSource: r.reference_source,
+      referenceDex: r.reference_dex,
+      lastChecked: r.timestamp,
+      detail: r.detail,
+    })),
+    summary: {
+      totalChecks: summary.total_checks,
+      passes: summary.passes,
+      warnings: summary.warnings,
+      fails: summary.fails,
+      skips: summary.skips,
+      accuracy,
+    },
+  };
+}
+
+function getValidationHistory(poolAddress, hours) {
+  const since = Date.now() - (hours || 24) * 3600 * 1000;
+
+  const rows = db.prepare(`
+    SELECT timestamp, our_price, reference_price, difference_pct, status
+    FROM price_validations
+    WHERE pool_address = ? AND timestamp >= ? AND status != 'skip'
+    ORDER BY timestamp
+  `).all(poolAddress, since);
+
+  return {
+    pool: poolAddress,
+    entries: rows.map((r) => ({
+      timestamp: r.timestamp,
+      ourPrice: r.our_price,
+      referencePrice: r.reference_price,
+      differencePct: r.difference_pct,
+      status: r.status,
+    })),
+  };
+}
+
 // ── Transaction & event queries ──
 
 function getRecentTransactions(poolAddress, limit) {
@@ -1026,6 +1138,7 @@ function getDbStats() {
   const wsCount = db.prepare("SELECT COUNT(*) as cnt FROM ws_connection_log").get().cnt;
   const slCount = db.prepare("SELECT COUNT(*) as cnt FROM scheduler_log").get().cnt;
   const ptCount = db.prepare("SELECT COUNT(*) as cnt FROM pool_transactions").get().cnt;
+  const pvCount = db.prepare("SELECT COUNT(*) as cnt FROM price_validations").get().cnt;
   const firstHc = db.prepare("SELECT MIN(timestamp) as ts FROM health_checks").get().ts;
 
   // Get file size
@@ -1042,6 +1155,7 @@ function getDbStats() {
     wsLogs: wsCount,
     schedulerLogs: slCount,
     poolTransactions: ptCount,
+    priceValidations: pvCount,
     collectingSince: firstHc || null,
     dbSizeBytes: fileSize,
     dbSizeMB: Math.round((fileSize / 1024 / 1024) * 10) / 10,
@@ -1064,8 +1178,9 @@ function cleanupOldData() {
   const ptDeleted = db.prepare("DELETE FROM pool_transactions WHERE timestamp < ?").run(threeDaysAgo).changes;
   const psDeleted = db.prepare("DELETE FROM pool_stats WHERE window_start < ?").run(threeDaysAgo).changes;
   const deDeleted = db.prepare("DELETE FROM defi_events WHERE timestamp < ?").run(threeDaysAgo).changes;
+  const pvDeleted = db.prepare("DELETE FROM price_validations WHERE timestamp < ?").run(threeDaysAgo).changes;
 
-  const totalDeleted = hcDeleted + radDeleted + rsdDeleted + ppdDeleted + slDeleted + rlDeleted + ptDeleted + psDeleted + deDeleted;
+  const totalDeleted = hcDeleted + radDeleted + rsdDeleted + ppdDeleted + slDeleted + rlDeleted + ptDeleted + psDeleted + deDeleted + pvDeleted;
   if (totalDeleted > 0) {
     console.log(`  DB cleanup: removed ${hcDeleted} health_checks (>7d), ${radDeleted} raw_account (>3d), ${rsdDeleted} raw_slot (>3d), ${ppdDeleted} parsed_pool (>3d), ${slDeleted} scheduler_log (>3d), ${rlDeleted} rate_limit_log (>3d), ${ptDeleted} pool_tx (>3d)`);
     db.exec("VACUUM");
@@ -1105,6 +1220,9 @@ module.exports = {
   getTransactionStats,
   getRecentEvents,
   getRecentFailoverEvents,
+  writePriceValidation,
+  getLatestValidations,
+  getValidationHistory,
   getDbStats,
   cleanupOldData,
   closeDb,

@@ -59,6 +59,7 @@ export default function App() {
   const pools = data?.pools || [];
   const parsedPool = data?.parsedPool || null;
   const pipeline = data?.pipeline || null;
+  const validation = data?.validation || null;
   const endpointNames = endpoints.map((e) => e.name);
 
   return (
@@ -200,7 +201,7 @@ export default function App() {
         }}
       >
         <SectionHeader title="Raydium AMM v4 — Parsed Pool State" />
-        <ParsedPoolData parsedPool={parsedPool} />
+        <ParsedPoolData parsedPool={parsedPool} validation={validation} />
       </div>
 
       {/* Section 8: Transactions */}

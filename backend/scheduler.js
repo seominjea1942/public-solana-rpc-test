@@ -2,6 +2,7 @@ const { POOL_ACCOUNTS } = require("./config");
 const { rateLimitedRpcPost, limiter } = require("./rate-limiter");
 const { parseRaydiumAmmV4 } = require("./pool-parser");
 const { runTxMonitor } = require("./tx-monitor");
+const { maybeValidate } = require("./price-validator");
 const {
   writeRawAccountData,
   writeParsedPoolData,
@@ -176,6 +177,15 @@ async function runPoolStateTask(pool) {
         const parsed = await parseRaydiumAmmV4(rpcUrl, base64Data, slot);
         rpcCalls += 2; // vault balance queries
         writeParsedPoolData(pool.address, pool.label, parsed);
+
+        // Validate price against DexScreener (rate-limited: once per 5 min per pool)
+        if (parsed.price > 0) {
+          maybeValidate(
+            { address: pool.address, label: pool.label, dex: pool.dex, poolType: pool.poolType, baseMint: parsed.baseMint },
+            parsed.price
+          ).catch(() => {}); // fire-and-forget, don't block the pipeline
+        }
+
         return { success: true, rpcCalls, itemsProcessed: 1 };
       } catch (err) {
         try {

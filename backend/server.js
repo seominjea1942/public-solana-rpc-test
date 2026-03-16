@@ -10,7 +10,7 @@ const {
   DB_PATH, cleanupOldData, closeDb, aggregateUptimeSummary,
   getUptimeStats, generateReport, getRawLatest, getRawCompare, getRawHistory, getRawExportCsv,
   getParsedLatest, getParsedHistory, getRecentTransactions, getTransactionStats, getRecentEvents,
-  getRecentFailoverEvents, getDbStats,
+  getRecentFailoverEvents, getLatestValidations, getValidationHistory, getDbStats,
 } = require("./database");
 
 const app = express();
@@ -148,6 +148,19 @@ app.get("/api/events", (req, res) => {
   res.json({ events: getRecentEvents(limit) });
 });
 
+// ── Price Validation API ──
+
+app.get("/api/validation/latest", (req, res) => {
+  res.json(getLatestValidations());
+});
+
+app.get("/api/validation/history", (req, res) => {
+  const pool = req.query.pool;
+  const hours = parseFloat(req.query.hours) || 24;
+  if (!pool) return res.status(400).json({ error: "pool query param required" });
+  res.json(getValidationHistory(pool, hours));
+});
+
 // SSE stream
 app.get("/api/stream", (req, res) => {
   res.writeHead(200, {
@@ -181,6 +194,7 @@ function buildUpdatePayload() {
     pools: POOL_ACCOUNTS,
     parsedPool: getParsedLatest(),
     pipeline: getSchedulerStatus(),
+    validation: getLatestValidations(),
   };
 }
 
