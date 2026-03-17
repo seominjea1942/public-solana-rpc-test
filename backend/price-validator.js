@@ -1,10 +1,42 @@
 const { writePriceValidation, getLatestValidations } = require("./database");
 
 /**
- * Fetch price from DexScreener (free, no auth needed).
- * Uses the token mint address to find the best pair.
+ * Fetch price from DexScreener using the EXACT pool address.
+ * This compares our parsed price against the same pool on DexScreener,
+ * not some other pool for the same token.
  *
+ * API: /latest/dex/pairs/solana/{poolAddress}
  * Rate limit: 300 req/min — we use ~0.8 req/min (4 pools x 1 per 5 min)
+ */
+async function getDexScreenerPriceByPool(poolAddress) {
+  try {
+    const response = await fetch(
+      `https://api.dexscreener.com/latest/dex/pairs/solana/${poolAddress}`
+    );
+    if (!response.ok) return null;
+    const data = await response.json();
+
+    // pairs endpoint returns { pair: {...} } (singular)
+    const pair = data.pair || (data.pairs && data.pairs[0]);
+    if (!pair || !pair.priceUsd) return null;
+
+    return {
+      price: parseFloat(pair.priceUsd),
+      dex: pair.dexId,
+      pairAddress: pair.pairAddress,
+      pairLabel: `${pair.baseToken?.symbol || "?"}/${pair.quoteToken?.symbol || "?"}`,
+      volume24h: pair.volume?.h24 || 0,
+      liquidity: pair.liquidity?.usd || 0,
+    };
+  } catch (err) {
+    console.error("[Validation] DexScreener pool fetch failed:", err.message);
+    return null;
+  }
+}
+
+/**
+ * Legacy: Fetch price by token mint (finds highest-liquidity pair).
+ * Used as fallback when pool-address lookup fails.
  */
 async function getDexScreenerPrice(tokenAddress) {
   try {
@@ -27,6 +59,7 @@ async function getDexScreenerPrice(tokenAddress) {
       price: parseFloat(bestPair.priceUsd),
       dex: bestPair.dexId,
       pairAddress: bestPair.pairAddress,
+      pairLabel: `${bestPair.baseToken?.symbol || "?"}/${bestPair.quoteToken?.symbol || "?"}`,
       volume24h: bestPair.volume?.h24 || 0,
       liquidity: bestPair.liquidity?.usd || 0,
     };
@@ -45,17 +78,29 @@ async function getDexScreenerPrice(tokenAddress) {
  *   > 2%    FAIL    — Parser is likely broken, needs investigation
  */
 async function validateParsedPrice(pool, parsedPrice) {
-  // Use SOL mint (base token) to look up on DexScreener
-  const baseMint = pool.baseMint;
-  if (!baseMint || !parsedPrice || parsedPrice <= 0) return;
+  if (!parsedPrice || parsedPrice <= 0) return;
 
-  const dexScreener = await getDexScreenerPrice(baseMint);
+  const poolAddress = pool.address || pool.poolAddress;
+
+  // Strategy: Use pool-address lookup (exact same pool) first,
+  // fall back to token-mint lookup if the pool isn't indexed on DexScreener
+  let dexScreener = await getDexScreenerPriceByPool(poolAddress);
+  let lookupMethod = "pool_address";
+
+  if (!dexScreener || !dexScreener.price || dexScreener.price <= 0) {
+    // Fallback to token mint lookup
+    const baseMint = pool.baseMint;
+    if (baseMint) {
+      dexScreener = await getDexScreenerPrice(baseMint);
+      lookupMethod = "token_mint_fallback";
+    }
+  }
 
   if (!dexScreener || !dexScreener.price || dexScreener.price <= 0) {
     try {
       writePriceValidation({
         timestamp: Date.now(),
-        poolAddress: pool.address || pool.poolAddress,
+        poolAddress,
         dex: pool.dex || "Raydium",
         poolType: pool.poolType || "AMM v4",
         ourPrice: parsedPrice,
@@ -78,10 +123,12 @@ async function validateParsedPrice(pool, parsedPrice) {
   else if (diff < 2.0) status = "warning";
   else status = "fail";
 
+  const refLabel = dexScreener.pairLabel || dexScreener.dex;
+
   try {
     writePriceValidation({
       timestamp: Date.now(),
-      poolAddress: pool.address || pool.poolAddress,
+      poolAddress,
       dex: pool.dex || "Raydium",
       poolType: pool.poolType || "AMM v4",
       ourPrice: parsedPrice,
@@ -89,10 +136,10 @@ async function validateParsedPrice(pool, parsedPrice) {
       differencePct: Math.round(diff * 1000) / 1000,
       status,
       referenceSource: "dexscreener",
-      referenceDex: dexScreener.dex,
+      referenceDex: `${dexScreener.dex} (${refLabel}) [${lookupMethod}]`,
       detail:
         diff >= 2.0
-          ? `Large deviation: ours $${parsedPrice.toFixed(4)} vs DexScreener $${dexScreener.price.toFixed(4)}`
+          ? `Large deviation: ours $${parsedPrice.toFixed(6)} vs DexScreener $${dexScreener.price.toFixed(6)} (${refLabel})`
           : null,
     });
   } catch (err) {
@@ -101,12 +148,16 @@ async function validateParsedPrice(pool, parsedPrice) {
 
   if (status === "fail") {
     console.warn(
-      `[Validation] FAIL: ${pool.label || pool.poolLabel} — Ours: $${parsedPrice.toFixed(4)}, ` +
-        `DexScreener: $${dexScreener.price.toFixed(4)}, Diff: ${diff.toFixed(2)}%`
+      `[Validation] FAIL: ${pool.label || pool.poolLabel} — Ours: $${parsedPrice.toFixed(6)}, ` +
+        `DexScreener: $${dexScreener.price.toFixed(6)} (${refLabel}), Diff: ${diff.toFixed(3)}%`
     );
   } else if (status === "warning") {
     console.warn(
-      `[Validation] WARNING: ${pool.label || pool.poolLabel} — Diff: ${diff.toFixed(2)}%`
+      `[Validation] WARNING: ${pool.label || pool.poolLabel} — Diff: ${diff.toFixed(3)}% (${refLabel})`
+    );
+  } else {
+    console.log(
+      `[Validation] PASS: ${pool.label || pool.poolLabel} — Diff: ${diff.toFixed(3)}% (${refLabel})`
     );
   }
 }
@@ -127,4 +178,4 @@ async function maybeValidate(pool, parsedPrice) {
   await validateParsedPrice(pool, parsedPrice);
 }
 
-module.exports = { getDexScreenerPrice, validateParsedPrice, maybeValidate };
+module.exports = { getDexScreenerPrice, getDexScreenerPriceByPool, validateParsedPrice, maybeValidate };

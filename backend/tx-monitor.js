@@ -1,7 +1,7 @@
 const { rateLimitedRpcPost } = require("./rate-limiter");
-const { writePoolTransaction, writeDefiEvent, getKnownSignatures, getPoolMints } = require("./database");
-
-const RAYDIUM_AMM_V4_PROGRAM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
+const { writePoolTransaction, writeDefiEvent, getKnownSignatures, getPoolMints, getFailedFetchSignatures, retryPoolTransaction, getWalletPoolHistory } = require("./database");
+const { classifyTx } = require("./parsers");
+const { extractSwapFromBalances, classifyEvent, buildEventDescription } = require("./parsers/utils");
 
 /**
  * Part B — Transaction Monitor
@@ -25,7 +25,7 @@ async function runTxMonitor(pool, rpcUrl) {
 
   // 1. Get recent signatures for this pool address
   // Use smaller limit to reduce RPC calls (each new sig = 1 getTransaction call)
-  const sigLimit = pool.poolType === "AMM v4" ? 5 : 3;
+  const sigLimit = 5;
   const sigResult = await rateLimitedRpcPost(rpcUrl, "getSignaturesForAddress", [
     pool.address,
     { limit: sigLimit },
@@ -58,13 +58,11 @@ async function runTxMonitor(pool, rpcUrl) {
 
   const newSignatures = signatures.filter((s) => !knownSigs.has(s.signature));
 
-  // Get pool mints for swap detail extraction (AMM v4 only)
+  // Get pool mints for swap detail extraction (all pool types)
   let poolMints = null;
-  if (pool.poolType === "AMM v4") {
-    try {
-      poolMints = getPoolMints(pool.address);
-    } catch {}
-  }
+  try {
+    poolMints = getPoolMints(pool.address);
+  } catch {}
 
   // 3. Fetch each new transaction
   for (const sig of newSignatures) {
@@ -94,51 +92,76 @@ async function runTxMonitor(pool, rpcUrl) {
       continue;
     }
 
-    // 4. Classify transaction type
+    // 4. Classify transaction type (all DEX types)
     const txData = txResult.data;
     let txType = "unparsed";
     let swapDetails = null;
     let event = { eventType: null, severity: "low" };
 
-    if (pool.poolType === "AMM v4") {
-      // First try log-based classification
-      txType = classifyAmmV4Tx(txData);
-
-      // If log-based says "other", try detecting by token balance changes
-      // Many swaps go through aggregators (Jupiter etc.) whose logs don't say "swap"
-      if (poolMints && (txType === "other" || txType === "swap")) {
-        swapDetails = extractSwapDetails(txData, poolMints);
-        if (swapDetails && swapDetails.usdValue > 0.01) {
-          txType = "swap"; // Confirmed swap via balance changes
-        } else if (txType === "other") {
-          // No meaningful balance changes — it's a crank/bot/observation
-          txType = "other";
-        }
-      } else if (txType === "swap" && poolMints) {
-        swapDetails = extractSwapDetails(txData, poolMints);
+    // Always extract fee payer (first account key) as the wallet
+    let feePayer = null;
+    try {
+      const accountKeys = txData.transaction?.message?.accountKeys;
+      if (accountKeys && accountKeys.length > 0) {
+        const firstKey = accountKeys[0];
+        feePayer = typeof firstKey === "string" ? firstKey : firstKey?.pubkey || null;
       }
+    } catch {}
 
-      // Classify event
-      event = classifyEvent(txType, swapDetails);
+    // Use unified classifier for all pool types
+    txType = classifyTx(pool.poolType, txData);
 
-      // Record notable events
-      if (event.severity !== "low" && event.eventType) {
-        try {
-          const desc = buildEventDescription(event.eventType, swapDetails, pool.label);
-          writeDefiEvent({
-            timestamp: sig.blockTime ? sig.blockTime * 1000 : Date.now(),
-            poolAddress: pool.address,
-            poolLabel: pool.label,
-            dex: pool.dex,
-            eventType: event.eventType,
-            severity: event.severity,
-            signature: sig.signature,
-            traderWallet: swapDetails?.traderWallet || null,
-            usdValue: swapDetails?.usdValue || null,
-            description: desc,
-          });
-        } catch {}
+    // Extract swap details from token balance changes if we have pool mints
+    if (poolMints && (txType === "other" || txType === "swap")) {
+      swapDetails = extractSwapFromBalances(txData, poolMints.base_mint, poolMints.quote_mint);
+      if (swapDetails && swapDetails.usdValue > 0.01) {
+        txType = "swap"; // Confirmed swap via balance changes
+      } else if (txType === "other") {
+        txType = "other";
       }
+    } else if (txType === "swap" && poolMints) {
+      swapDetails = extractSwapFromBalances(txData, poolMints.base_mint, poolMints.quote_mint);
+    }
+
+    // Use fee payer as wallet when swap details don't provide one
+    const traderWallet = swapDetails?.traderWallet || feePayer;
+
+    // Look up wallet history for smart money detection (only for swaps with a known wallet)
+    let walletHistory = null;
+    if (traderWallet && txType === "swap") {
+      try {
+        walletHistory = getWalletPoolHistory(traderWallet, pool.address);
+      } catch {}
+    }
+
+    // Classify event (pass wallet history for behavior-based detection)
+    event = classifyEvent(txType, swapDetails, walletHistory);
+
+    // Record notable events (low severity "repeat_trader" also gets stored now)
+    const shouldStore = (event.severity !== "low" && event.eventType) ||
+                        event.eventType === "repeat_trader";
+    if (shouldStore) {
+      try {
+        const desc = buildEventDescription(event.eventType, swapDetails, pool.label, {
+          signature: sig.signature,
+          poolAddress: pool.address,
+          creatorWallet: feePayer,
+          pair: pool.label.match(/— (.+)$/)?.[1] || null,
+          walletHistory,
+        });
+        writeDefiEvent({
+          timestamp: sig.blockTime ? sig.blockTime * 1000 : Date.now(),
+          poolAddress: pool.address,
+          poolLabel: pool.label,
+          dex: pool.dex,
+          eventType: event.eventType,
+          severity: event.severity,
+          signature: sig.signature,
+          traderWallet: traderWallet,
+          usdValue: swapDetails?.usdValue || null,
+          description: desc,
+        });
+      } catch {}
     }
 
     // 5. Store transaction
@@ -157,7 +180,7 @@ async function runTxMonitor(pool, rpcUrl) {
         baseAmount: swapDetails?.baseAmount || null,
         quoteAmount: swapDetails?.quoteAmount || null,
         usdValue: swapDetails?.usdValue || null,
-        traderWallet: swapDetails?.traderWallet || null,
+        traderWallet: traderWallet,
         fee: txData?.meta?.fee || null,
         eventType: event.eventType || null,
         eventSeverity: event.severity || null,
@@ -183,167 +206,141 @@ async function runTxMonitor(pool, rpcUrl) {
 }
 
 /**
- * Classify Raydium AMM v4 transaction type from log messages.
- * Checks log messages for swap/deposit/withdraw indicators.
+ * Direct RPC fetch (bypasses main rate limiter).
+ * Used for retry/backfill to avoid competing with the main pipeline.
+ * Has its own built-in delay between calls.
  */
-function classifyAmmV4Tx(txData) {
-  if (!txData || !txData.meta) return "unparsed";
-  if (txData.meta.err) return "failed";
+async function directRpcPost(url, method, params = []) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
 
-  const logs = txData.meta.logMessages || [];
-  for (const log of logs) {
-    if (log.includes("ray_log") || log.includes("swap") || log.includes("Swap")) {
-      return "swap";
+  const start = Date.now();
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: controller.signal,
+    });
+
+    const latency = Date.now() - start;
+    if (res.status === 429) {
+      return { latency, success: false, rateLimited: true, data: null, error: "429 Too Many Requests" };
     }
-    if (log.includes("Deposit") || log.includes("deposit") || log.includes("AddLiquidity")) {
-      return "add_liquidity";
+
+    const data = await res.json();
+    if (data.error) {
+      return { latency, success: false, rateLimited: false, data: null, error: data.error.message };
     }
-    if (log.includes("Withdraw") || log.includes("withdraw") || log.includes("RemoveLiquidity")) {
-      return "remove_liquidity";
-    }
-    if (log.includes("Initialize") || log.includes("initialize")) {
-      return "initialize";
-    }
+
+    return { latency, success: true, rateLimited: false, data: data.result };
+  } catch (err) {
+    return { latency: Date.now() - start, success: false, rateLimited: false, data: null, error: err.message };
+  } finally {
+    clearTimeout(timeout);
   }
-
-  return "other";
 }
 
 /**
- * Extract swap amounts from pre/post token balances.
- * Looks for balance changes matching the pool's base/quote mints.
+ * Retry previously-failed transaction fetches for a pool.
  *
- * Strategy: Sum ALL balance changes per mint across all accounts.
- * For a swap, the pool vaults will show opposite changes (one increases, one decreases).
- * We look at the net change from the pool's perspective.
+ * Picks up to `maxRetries` oldest `fetch_error`/`unparsed` entries and re-fetches them.
+ * Uses direct fetch (not the main rate limiter) with a secondary RPC endpoint,
+ * so retries don't compete with the main health check / scheduler pipeline.
  *
- * @param {object} txData - Full transaction data from getTransaction
- * @param {object} poolMints - { base_mint, quote_mint, base_vault, quote_vault } from parsed_pool_data
- * @returns {{ side, baseAmount, quoteAmount, usdValue, traderWallet } | null}
+ * Adds 3-second delays between calls to stay under rate limits.
+ *
+ * @param {object} pool - Pool object from config
+ * @param {string} rpcUrl - RPC endpoint URL (should be a secondary/non-primary endpoint)
+ * @param {number} maxRetries - Max retries per invocation (default: 2)
+ * @returns {{ retriedCount, successCount, rpcCalls }}
  */
-function extractSwapDetails(txData, poolMints) {
-  if (!txData?.meta) return null;
+async function retryFailedTransactions(pool, rpcUrl, maxRetries = 2) {
+  let retriedCount = 0;
+  let successCount = 0;
+  let rpcCalls = 0;
 
-  const preBalances = txData.meta.preTokenBalances || [];
-  const postBalances = txData.meta.postTokenBalances || [];
+  const failedRows = getFailedFetchSignatures(pool.address, maxRetries);
+  if (failedRows.length === 0) return { retriedCount, successCount, rpcCalls };
 
-  // Track changes per account index for base and quote mints
-  let baseChange = 0;
-  let quoteChange = 0;
-  let foundBaseChange = false;
-  let foundQuoteChange = false;
-
-  for (const post of postBalances) {
-    const pre = preBalances.find(
-      (p) => p.accountIndex === post.accountIndex
-    );
-    if (!pre) continue;
-
-    const postAmt = parseFloat(post.uiTokenAmount?.uiAmountString || "0");
-    const preAmt = parseFloat(pre.uiTokenAmount?.uiAmountString || "0");
-    const change = postAmt - preAmt;
-
-    if (Math.abs(change) < 1e-9) continue;
-
-    if (post.mint === poolMints.base_mint) {
-      // Sum up all base mint changes — look at the largest absolute change
-      // which is likely the pool vault
-      if (Math.abs(change) > Math.abs(baseChange)) {
-        baseChange = change;
-        foundBaseChange = true;
-      }
-    } else if (post.mint === poolMints.quote_mint) {
-      if (Math.abs(change) > Math.abs(quoteChange)) {
-        quoteChange = change;
-        foundQuoteChange = true;
-      }
-    }
-  }
-
-  // Need at least one meaningful change
-  if (!foundBaseChange && !foundQuoteChange) return null;
-  if (Math.abs(baseChange) < 0.0001 && Math.abs(quoteChange) < 0.01) return null;
-
-  // Determine buy/sell from TRADER's perspective:
-  // Pool received base (baseChange > 0 from pool view) = trader sold base = SELL
-  // Pool lost base (baseChange < 0 from pool view) = trader bought base = BUY
-  // We track the pool vault changes, so baseChange > 0 means pool gained base
-  const isBuy = baseChange > 0; // pool gained base = someone sold to pool = hmm...
-  // Actually: if the largest base change is positive, pool vault gained SOL = someone sold SOL = SELL
-  // If negative, pool vault lost SOL = someone bought SOL = BUY
-  const traderBought = baseChange < 0;
-
-  const baseAmount = Math.abs(baseChange);
-  const quoteAmount = Math.abs(quoteChange);
-  const usdValue = quoteAmount; // For SOL/USDC, quote = USDC ≈ USD
-
-  // Find the trader wallet (fee payer / signer)
-  let traderWallet = null;
+  let poolMints = null;
   try {
-    const accountKeys = txData.transaction?.message?.accountKeys;
-    if (accountKeys && accountKeys.length > 0) {
-      const firstKey = accountKeys[0];
-      traderWallet = typeof firstKey === "string"
-        ? firstKey
-        : firstKey?.pubkey || null;
-    }
+    poolMints = getPoolMints(pool.address);
   } catch {}
 
-  return {
-    side: traderBought ? "buy" : "sell",
-    baseAmount: Math.round(baseAmount * 10000) / 10000,
-    quoteAmount: Math.round(quoteAmount * 100) / 100,
-    usdValue: Math.round(usdValue * 100) / 100,
-    traderWallet,
-  };
-}
-
-/**
- * Classify an event based on tx type and swap details.
- */
-function classifyEvent(txType, swapDetails) {
-  if (txType === "initialize") {
-    return { eventType: "new_pool", severity: "high" };
-  }
-
-  if (txType === "add_liquidity") {
-    return { eventType: "liquidity_add", severity: "medium" };
-  }
-
-  if (txType === "remove_liquidity") {
-    return { eventType: "liquidity_remove", severity: "medium" };
-  }
-
-  if (txType === "swap" && swapDetails) {
-    if (swapDetails.usdValue > 25000) {
-      return { eventType: "whale", severity: "high" };
+  for (const row of failedRows) {
+    // 1.5-second delay between retry calls (using secondary endpoint, separate from main pipeline)
+    if (retriedCount > 0) {
+      await new Promise((r) => setTimeout(r, 1500));
     }
-    return { eventType: "swap", severity: "low" };
-  }
 
-  return { eventType: null, severity: "low" };
-}
+    const txResult = await directRpcPost(rpcUrl, "getTransaction", [
+      row.signature,
+      { encoding: "jsonParsed", maxSupportedTransactionVersion: 0 },
+    ]);
+    rpcCalls++;
+    retriedCount++;
 
-/**
- * Build a human-readable event description.
- */
-function buildEventDescription(eventType, swapDetails, poolLabel) {
-  const shortLabel = (poolLabel || "").replace(/ — .*/, "");
-  switch (eventType) {
-    case "whale": {
-      const side = swapDetails?.side || "swap";
-      const usd = swapDetails?.usdValue?.toLocaleString() || "?";
-      return `Whale ${side}: $${usd} on ${shortLabel}`;
+    if (!txResult.success) {
+      // Still failing — leave as-is, will be retried next cycle
+      continue;
     }
-    case "liquidity_add":
-      return `Liquidity added to ${shortLabel}`;
-    case "liquidity_remove":
-      return `Liquidity removed from ${shortLabel}`;
-    case "new_pool":
-      return `New pool created: ${shortLabel}`;
-    default:
-      return `${eventType} on ${shortLabel}`;
+
+    // Classify the transaction
+    const txData = txResult.data;
+    let txType = classifyTx(pool.poolType, txData);
+    let swapDetails = null;
+    let event = { eventType: null, severity: "low" };
+
+    if (poolMints && (txType === "other" || txType === "swap")) {
+      swapDetails = extractSwapFromBalances(txData, poolMints.base_mint, poolMints.quote_mint);
+      if (swapDetails && swapDetails.usdValue > 0.01) {
+        txType = "swap";
+      }
+    }
+
+    // Extract fee payer for wallet info
+    let feePayer = null;
+    try {
+      const acctKeys = txData.transaction?.message?.accountKeys;
+      if (acctKeys && acctKeys.length > 0) {
+        const k = acctKeys[0];
+        feePayer = typeof k === "string" ? k : k?.pubkey || null;
+      }
+    } catch {}
+    const wallet = swapDetails?.traderWallet || feePayer;
+
+    // Wallet history for smart money detection
+    let walletHistory = null;
+    if (wallet && txType === "swap") {
+      try { walletHistory = getWalletPoolHistory(wallet, pool.address); } catch {}
+    }
+
+    event = classifyEvent(txType, swapDetails, walletHistory);
+
+    // Update the DB record
+    try {
+      retryPoolTransaction(row.id, txType, {
+        side: swapDetails?.side || null,
+        baseAmount: swapDetails?.baseAmount || null,
+        quoteAmount: swapDetails?.quoteAmount || null,
+        usdValue: swapDetails?.usdValue || null,
+        traderWallet: wallet,
+        fee: txData?.meta?.fee || null,
+        eventType: event.eventType || null,
+        eventSeverity: event.severity || null,
+      });
+      successCount++;
+    } catch (err) {
+      console.error(`[TxMonitor] Retry update error for ${row.signature.slice(0, 12)}...:`, err.message);
+    }
   }
+
+  if (successCount > 0) {
+    console.log(`[TxMonitor] Retried ${retriedCount} for ${pool.label}: ${successCount} recovered`);
+  }
+
+  return { retriedCount, successCount, rpcCalls };
 }
 
-module.exports = { runTxMonitor };
+module.exports = { runTxMonitor, retryFailedTransactions };

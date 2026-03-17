@@ -4,9 +4,12 @@
   "description": "Solana RPC Health Tester & Failover Experiment",
   "scripts": {
     "install:all": "cd backend && npm install && cd ../frontend && npm install",
-    "start:backend": "cd backend && node server.js",
+    "start:backend": "cd backend && /usr/local/bin/node server.js",
     "start:frontend": "cd frontend && npm run dev",
     "start": "npm run start:backend & npm run start:frontend",
-    "dev": "npm run start"
+    "dev": "npm run start",
+    "build": "cd frontend && npm run build",
+    "deploy": "cd frontend && npm run build && cd ../backend && /usr/local/bin/node server.js",
+    "tunnel": "ngrok http 3099"
   }
 }

@@ -1,6 +1,7 @@
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
+const fs = require("fs");
 const { RPC_ENDPOINTS, HEALTH_CHECK_INTERVAL, HELIUS_API_KEY, POOL_ACCOUNTS } = require("./config");
 const { initEndpointData, runHealthCheck, getAllStats, getLatencyHistory, getHealthiestEndpoint, getEndpointUrl } = require("./rpc-tester");
 const { initWsData, startWsTesting, getAllWsStatus, closeAllWs } = require("./ws-tester");
@@ -9,7 +10,7 @@ const { startScheduler, stopScheduler, getSchedulerStatus } = require("./schedul
 const {
   DB_PATH, cleanupOldData, closeDb, aggregateUptimeSummary,
   getUptimeStats, generateReport, getRawLatest, getRawCompare, getRawHistory, getRawExportCsv,
-  getParsedLatest, getParsedHistory, getRecentTransactions, getTransactionStats, getRecentEvents,
+  getParsedLatest, getAllParsedLatest, getParsedHistory, getRecentTransactions, getTransactionStats, getRecentEvents,
   getRecentFailoverEvents, getLatestValidations, getValidationHistory, getDbStats,
 } = require("./database");
 
@@ -71,7 +72,7 @@ app.get("/api/raw/latest", (req, res) => {
   const hours = Math.floor(duration / 3600000);
   const mins = Math.floor((duration % 3600000) / 60000);
   res.json({
-    pools: getRawLatest(),
+    pools: getRawLatest(POOL_ACCOUNTS.map(p => p.address)),
     totalSnapshots: dbStats.rawAccountData,
     monitoringDuration: `${hours}h ${mins}m`,
     dbSizeMB: dbStats.dbSizeMB,
@@ -79,7 +80,7 @@ app.get("/api/raw/latest", (req, res) => {
 });
 
 app.get("/api/raw/compare", (req, res) => {
-  res.json({ comparison: getRawCompare() });
+  res.json({ comparison: getRawCompare(POOL_ACCOUNTS.map(p => p.address)) });
 });
 
 app.get("/api/raw/history", (req, res) => {
@@ -101,7 +102,17 @@ app.get("/api/raw/export", (req, res) => {
 // ── Parsed Pool Data API Routes ──
 
 app.get("/api/parsed/latest", (req, res) => {
-  res.json(getParsedLatest() || { error: "No parsed data yet" });
+  const pool = req.query.pool;
+  const activeAddresses = POOL_ACCOUNTS.map(p => p.address);
+  if (pool) {
+    // Return latest for a specific pool
+    const all = getAllParsedLatest(activeAddresses);
+    const match = all.find((p) => p.poolAddress === pool);
+    res.json(match || { error: "No parsed data for this pool" });
+  } else {
+    // Return all pools' latest data
+    res.json({ pools: getAllParsedLatest(activeAddresses) });
+  }
 });
 
 app.get("/api/parsed/history", (req, res) => {
@@ -116,7 +127,11 @@ app.get("/api/db/stats", (req, res) => {
 });
 
 app.get("/api/db/download", (req, res) => {
-  res.download(DB_PATH, "rpc-data.db");
+  if (fs.existsSync(DB_PATH)) {
+    res.download(DB_PATH, "rpc-data.db");
+  } else {
+    res.status(404).json({ error: "Database file not found" });
+  }
 });
 
 app.get("/api/pools", (req, res) => {
@@ -181,6 +196,19 @@ app.get("/api/stream", (req, res) => {
   });
 });
 
+// ── Serve frontend build (for production / ngrok deployment) ──
+const frontendDist = path.join(__dirname, "../frontend/dist");
+if (fs.existsSync(frontendDist)) {
+  app.use(express.static(frontendDist));
+  // SPA catch-all: serve index.html for any non-API route
+  app.get("*", (req, res) => {
+    if (!req.path.startsWith("/api/")) {
+      res.sendFile(path.join(frontendDist, "index.html"));
+    }
+  });
+  console.log("[Static] Serving frontend from frontend/dist/");
+}
+
 function buildUpdatePayload() {
   return {
     type: "update",
@@ -192,9 +220,10 @@ function buildUpdatePayload() {
     heliusEnabled: !!HELIUS_API_KEY,
     dbStats: getDbStats(),
     pools: POOL_ACCOUNTS,
-    parsedPool: getParsedLatest(),
+    parsedPool: getParsedLatest(),       // backward compatible (single pool)
+    parsedPools: getAllParsedLatest(POOL_ACCOUNTS.map(p => p.address)),    // active pools only
     pipeline: getSchedulerStatus(),
-    validation: getLatestValidations(),
+    validation: getLatestValidations(POOL_ACCOUNTS.map(p => p.address)),
   };
 }
 
@@ -286,7 +315,14 @@ async function start() {
   app.listen(PORT, () => {
     console.log(`\nServer running on http://localhost:${PORT}`);
     console.log(`SSE stream: http://localhost:${PORT}/api/stream`);
-    console.log(`Dashboard: http://localhost:5173\n`);
+    if (fs.existsSync(frontendDist)) {
+      console.log(`Dashboard: http://localhost:${PORT} (serving built frontend)`);
+      console.log(`  Ready for ngrok: ngrok http ${PORT}`);
+    } else {
+      console.log(`Dashboard: http://localhost:5173 (dev mode — run Vite separately)`);
+      console.log(`  To build for deploy: cd frontend && npm run build`);
+    }
+    console.log();
   });
 }
 

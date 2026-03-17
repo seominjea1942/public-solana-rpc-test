@@ -58,6 +58,7 @@ export default function App() {
   const dbStats = data?.dbStats || null;
   const pools = data?.pools || [];
   const parsedPool = data?.parsedPool || null;
+  const parsedPools = data?.parsedPools || [];
   const pipeline = data?.pipeline || null;
   const validation = data?.validation || null;
   const endpointNames = endpoints.map((e) => e.name);
@@ -190,7 +191,7 @@ export default function App() {
         <PipelineStatus pipeline={pipeline} />
       </div>
 
-      {/* Section 7: Parsed Pool Data (Raydium AMM v4) */}
+      {/* Section 7: Multi-DEX Parsed Pool Data */}
       <div
         style={{
           marginBottom: 28,
@@ -200,8 +201,8 @@ export default function App() {
           padding: 20,
         }}
       >
-        <SectionHeader title="Raydium AMM v4 — Parsed Pool State" />
-        <ParsedPoolData parsedPool={parsedPool} validation={validation} />
+        <SectionHeader title="Multi-DEX Parsed Pool State" />
+        <ParsedPoolData parsedPools={parsedPools} parsedPool={parsedPool} validation={validation} />
       </div>
 
       {/* Section 8: Transactions */}

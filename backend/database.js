@@ -223,6 +223,8 @@ const colsToAdd = [
   ["pool_transactions", "trader_wallet", "TEXT"],
   ["pool_transactions", "event_type", "TEXT"],
   ["pool_transactions", "event_severity", "TEXT"],
+  ["parsed_pool_data", "dex", "TEXT"],
+  ["parsed_pool_data", "pool_type", "TEXT"],
 ];
 for (const [table, col, type] of colsToAdd) {
   try {
@@ -303,8 +305,9 @@ const insertParsedPoolData = db.prepare(`
      base_vault, quote_vault, base_decimal, quote_decimal,
      base_amount, quote_amount, base_amount_raw, quote_amount_raw,
      price, liquidity_usd, fee_rate, status, lp_reserve,
-     open_orders, market_id, slot, parse_success, error_message)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     open_orders, market_id, slot, parse_success, error_message,
+     dex, pool_type)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const insertSchedulerLog = db.prepare(`
@@ -431,7 +434,7 @@ function writeRawSlotData(endpointName, slotNumber) {
   insertRawSlotData.run(Date.now(), endpointName, slotNumber, null);
 }
 
-function writeParsedPoolData(poolAddress, poolLabel, parsed) {
+function writeParsedPoolData(poolAddress, poolLabel, parsed, dex, poolType) {
   if (parsed.parseSuccess) {
     insertParsedPoolData.run(
       Date.now(), poolAddress, poolLabel,
@@ -443,7 +446,8 @@ function writeParsedPoolData(poolAddress, poolLabel, parsed) {
       parsed.price, parsed.liquidityUsd, parsed.feeRate,
       parsed.status, parsed.lpReserve,
       parsed.openOrders, parsed.marketId,
-      parsed.slot || null, 1, null
+      parsed.slot || null, 1, null,
+      dex || null, poolType || null
     );
   } else {
     insertParsedPoolData.run(
@@ -451,7 +455,8 @@ function writeParsedPoolData(poolAddress, poolLabel, parsed) {
       null, null, null, null, null, null, null,
       null, null, null, null, null, null, null,
       null, null, null, null, null,
-      0, parsed.error || "unknown error"
+      0, parsed.error || "unknown error",
+      dex || null, poolType || null
     );
   }
 }
@@ -731,11 +736,22 @@ function generateReport(hours) {
 
 // ── Raw data queries ──
 
-function getRawLatest() {
-  const pools = db.prepare(`
-    SELECT DISTINCT account_address, pool_label, dex, pool_type, program_id
-    FROM raw_account_data ORDER BY dex, pool_type
-  `).all();
+function getRawLatest(activeAddresses) {
+  let pools;
+  if (activeAddresses && activeAddresses.length > 0) {
+    const placeholders = activeAddresses.map(() => "?").join(",");
+    pools = db.prepare(`
+      SELECT DISTINCT account_address, pool_label, dex, pool_type, program_id
+      FROM raw_account_data
+      WHERE account_address IN (${placeholders})
+      ORDER BY dex, pool_type
+    `).all(...activeAddresses);
+  } else {
+    pools = db.prepare(`
+      SELECT DISTINCT account_address, pool_label, dex, pool_type, program_id
+      FROM raw_account_data ORDER BY dex, pool_type
+    `).all();
+  }
 
   const grouped = {};
 
@@ -766,16 +782,31 @@ function getRawLatest() {
   return grouped;
 }
 
-function getRawCompare() {
-  const rows = db.prepare(`
-    SELECT dex, pool_type, account_address,
-      AVG(data_size) as avg_data_size,
-      COUNT(*) as snapshot_count
-    FROM raw_account_data
-    WHERE success = 1 AND dex IS NOT NULL
-    GROUP BY dex, pool_type, account_address
-    ORDER BY dex, pool_type
-  `).all();
+function getRawCompare(activeAddresses) {
+  let rows;
+  if (activeAddresses && activeAddresses.length > 0) {
+    const placeholders = activeAddresses.map(() => "?").join(",");
+    rows = db.prepare(`
+      SELECT dex, pool_type, account_address,
+        AVG(data_size) as avg_data_size,
+        COUNT(*) as snapshot_count
+      FROM raw_account_data
+      WHERE success = 1 AND dex IS NOT NULL
+        AND account_address IN (${placeholders})
+      GROUP BY dex, pool_type, account_address
+      ORDER BY dex, pool_type
+    `).all(...activeAddresses);
+  } else {
+    rows = db.prepare(`
+      SELECT dex, pool_type, account_address,
+        AVG(data_size) as avg_data_size,
+        COUNT(*) as snapshot_count
+      FROM raw_account_data
+      WHERE success = 1 AND dex IS NOT NULL
+      GROUP BY dex, pool_type, account_address
+      ORDER BY dex, pool_type
+    `).all();
+  }
 
   return rows.map((r) => ({
     dex: r.dex,
@@ -822,6 +853,10 @@ function getRawExportCsv(poolAddress, hours) {
 
 // ── Parsed pool data queries ──
 
+/**
+ * Get latest parsed data for a single pool (backward compatible).
+ * Returns the most recent successful parse for the first pool with data.
+ */
 function getParsedLatest() {
   const latest = db.prepare(`
     SELECT * FROM parsed_pool_data
@@ -830,8 +865,50 @@ function getParsedLatest() {
   `).get();
 
   if (!latest) return null;
+  return _formatParsedRow(latest);
+}
 
-  // Price change helper: find closest record at or before target time
+/**
+ * Get latest parsed data for ALL pools.
+ * Returns an array of latest entries, one per pool address.
+ */
+/**
+ * Get latest parsed data for all pools.
+ * @param {string[]} [activeAddresses] - If provided, only return pools in this list.
+ *   This filters out stale data from pools that were removed from config.
+ */
+function getAllParsedLatest(activeAddresses) {
+  let rows;
+  if (activeAddresses && activeAddresses.length > 0) {
+    const placeholders = activeAddresses.map(() => "?").join(",");
+    rows = db.prepare(`
+      SELECT ppd.* FROM parsed_pool_data ppd
+      INNER JOIN (
+        SELECT pool_address, MAX(timestamp) as max_ts
+        FROM parsed_pool_data
+        WHERE parse_success = 1 AND pool_address IN (${placeholders})
+        GROUP BY pool_address
+      ) latest ON ppd.pool_address = latest.pool_address AND ppd.timestamp = latest.max_ts
+      ORDER BY ppd.pool_address
+    `).all(...activeAddresses);
+  } else {
+    rows = db.prepare(`
+      SELECT ppd.* FROM parsed_pool_data ppd
+      INNER JOIN (
+        SELECT pool_address, MAX(timestamp) as max_ts
+        FROM parsed_pool_data
+        WHERE parse_success = 1
+        GROUP BY pool_address
+      ) latest ON ppd.pool_address = latest.pool_address AND ppd.timestamp = latest.max_ts
+      ORDER BY ppd.pool_address
+    `).all();
+  }
+
+  return rows.map((r) => _formatParsedRow(r));
+}
+
+function _formatParsedRow(latest) {
+  // Price change helper
   function priceAt(poolAddress, msAgo) {
     const target = Date.now() - msAgo;
     const row = db.prepare(`
@@ -851,7 +928,6 @@ function getParsedLatest() {
     }
   }
 
-  // Parse stats
   const parseStats = db.prepare(`
     SELECT
       COUNT(*) as total,
@@ -863,6 +939,8 @@ function getParsedLatest() {
   return {
     poolAddress: latest.pool_address,
     poolLabel: latest.pool_label,
+    dex: latest.dex || null,
+    poolType: latest.pool_type || null,
     timestamp: latest.timestamp,
     baseMint: latest.base_mint,
     quoteMint: latest.quote_mint,
@@ -929,28 +1007,61 @@ function getRecentFailoverEvents(limit) {
 
 // ── Price validation queries ──
 
-function getLatestValidations() {
+/**
+ * @param {string[]} [activeAddresses] - If provided, only return validations for these pools.
+ */
+function getLatestValidations(activeAddresses) {
   // Get latest validation per pool
-  const rows = db.prepare(`
-    SELECT pv.* FROM price_validations pv
-    INNER JOIN (
-      SELECT pool_address, MAX(timestamp) as max_ts
-      FROM price_validations
-      GROUP BY pool_address
-    ) latest ON pv.pool_address = latest.pool_address AND pv.timestamp = latest.max_ts
-    ORDER BY pv.pool_address
-  `).all();
+  let rows;
+  if (activeAddresses && activeAddresses.length > 0) {
+    const placeholders = activeAddresses.map(() => "?").join(",");
+    rows = db.prepare(`
+      SELECT pv.* FROM price_validations pv
+      INNER JOIN (
+        SELECT pool_address, MAX(timestamp) as max_ts
+        FROM price_validations
+        WHERE pool_address IN (${placeholders})
+        GROUP BY pool_address
+      ) latest ON pv.pool_address = latest.pool_address AND pv.timestamp = latest.max_ts
+      ORDER BY pv.pool_address
+    `).all(...activeAddresses);
+  } else {
+    rows = db.prepare(`
+      SELECT pv.* FROM price_validations pv
+      INNER JOIN (
+        SELECT pool_address, MAX(timestamp) as max_ts
+        FROM price_validations
+        GROUP BY pool_address
+      ) latest ON pv.pool_address = latest.pool_address AND pv.timestamp = latest.max_ts
+      ORDER BY pv.pool_address
+    `).all();
+  }
 
-  // Get summary stats (all time)
-  const summary = db.prepare(`
-    SELECT
-      COUNT(*) as total_checks,
-      COUNT(CASE WHEN status = 'pass' THEN 1 END) as passes,
-      COUNT(CASE WHEN status = 'warning' THEN 1 END) as warnings,
-      COUNT(CASE WHEN status = 'fail' THEN 1 END) as fails,
-      COUNT(CASE WHEN status = 'skip' THEN 1 END) as skips
-    FROM price_validations
-  `).get();
+  // Get summary stats (active pools only)
+  let summary;
+  if (activeAddresses && activeAddresses.length > 0) {
+    const placeholders = activeAddresses.map(() => "?").join(",");
+    summary = db.prepare(`
+      SELECT
+        COUNT(*) as total_checks,
+        COUNT(CASE WHEN status = 'pass' THEN 1 END) as passes,
+        COUNT(CASE WHEN status = 'warning' THEN 1 END) as warnings,
+        COUNT(CASE WHEN status = 'fail' THEN 1 END) as fails,
+        COUNT(CASE WHEN status = 'skip' THEN 1 END) as skips
+      FROM price_validations
+      WHERE pool_address IN (${placeholders})
+    `).get(...activeAddresses);
+  } else {
+    summary = db.prepare(`
+      SELECT
+        COUNT(*) as total_checks,
+        COUNT(CASE WHEN status = 'pass' THEN 1 END) as passes,
+        COUNT(CASE WHEN status = 'warning' THEN 1 END) as warnings,
+        COUNT(CASE WHEN status = 'fail' THEN 1 END) as fails,
+        COUNT(CASE WHEN status = 'skip' THEN 1 END) as skips
+      FROM price_validations
+    `).get();
+  }
 
   const totalNonSkip = summary.passes + summary.warnings + summary.fails;
   const accuracy = totalNonSkip > 0
@@ -1098,12 +1209,34 @@ function getTransactionStats(poolAddress, periodHours) {
 }
 
 function getRecentEvents(limit) {
+  // Fetch a larger set, then deduplicate new_pool (keep only latest per pool)
+  // and prioritize interesting events (whale, accumulator, etc.)
   const rows = db.prepare(`
     SELECT * FROM defi_events
     ORDER BY timestamp DESC LIMIT ?
-  `).all(limit || 20);
+  `).all(Math.max(limit || 20, 100));
 
-  return rows.map((r) => ({
+  // Deduplicate: for new_pool, keep only the latest per pool_address
+  const seenNewPools = new Set();
+  const deduped = [];
+  for (const r of rows) {
+    if (r.event_type === "new_pool") {
+      if (seenNewPools.has(r.pool_address)) continue;
+      seenNewPools.add(r.pool_address);
+    }
+    deduped.push(r);
+  }
+
+  // Sort: high severity first at top, then by timestamp
+  const severityOrder = { high: 0, medium: 1, low: 2 };
+  deduped.sort((a, b) => {
+    const sa = severityOrder[a.severity] ?? 3;
+    const sb = severityOrder[b.severity] ?? 3;
+    if (sa !== sb) return sa - sb;
+    return b.timestamp - a.timestamp;
+  });
+
+  return deduped.slice(0, limit || 20).map((r) => ({
     timestamp: r.timestamp,
     poolAddress: r.pool_address,
     poolLabel: r.pool_label,
@@ -1121,6 +1254,27 @@ function getRecentEvents(limit) {
  * Look up pool's baseMint and quoteMint from the latest parsed data.
  * Used by tx-monitor to identify token balance changes in transactions.
  */
+/**
+ * Get a wallet's recent trading history on a specific pool.
+ * Used for smart money / repeat trader / accumulator detection.
+ */
+function getWalletPoolHistory(walletAddress, poolAddress) {
+  if (!walletAddress || !poolAddress) return null;
+  const row = db.prepare(`
+    SELECT
+      COUNT(*) as trade_count,
+      COUNT(CASE WHEN side = 'buy' THEN 1 END) as buy_count,
+      COUNT(CASE WHEN side = 'sell' THEN 1 END) as sell_count,
+      COALESCE(SUM(usd_value), 0) as total_usd,
+      COALESCE(AVG(usd_value), 0) as avg_usd,
+      MIN(block_time) as first_seen,
+      MAX(block_time) as last_seen
+    FROM pool_transactions
+    WHERE trader_wallet = ? AND pool_address = ? AND tx_type = 'swap'
+  `).get(walletAddress, poolAddress);
+  return row && row.trade_count > 0 ? row : null;
+}
+
 function getPoolMints(poolAddress) {
   const row = db.prepare(`
     SELECT base_mint, quote_mint, base_vault, quote_vault, base_decimal, quote_decimal
@@ -1187,6 +1341,65 @@ function cleanupOldData() {
   }
 }
 
+/**
+ * Get the latest SOL/USD price from any SOL/USDC pool.
+ * Used by parsers for non-USDC pairs to convert prices to USD.
+ * Returns null if no recent SOL price available.
+ */
+function getSolUsdPrice() {
+  const row = db.prepare(`
+    SELECT price FROM parsed_pool_data
+    WHERE base_mint = 'So11111111111111111111111111111111111111112'
+      AND quote_mint = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+      AND parse_success = 1 AND price > 0
+    ORDER BY timestamp DESC LIMIT 1
+  `).get();
+  return row?.price || null;
+}
+
+/**
+ * Get transactions that need retrying for a given pool.
+ * Includes `fetch_error` (RPC call failed) and `unparsed` (classifier wasn't ready).
+ * Returns oldest entries first, limited to `limit` rows.
+ */
+function getFailedFetchSignatures(poolAddress, limit = 3) {
+  return db.prepare(`
+    SELECT id, signature, block_time, slot, tx_type
+    FROM pool_transactions
+    WHERE pool_address = ? AND tx_type IN ('fetch_error', 'unparsed')
+    ORDER BY timestamp ASC
+    LIMIT ?
+  `).all(poolAddress, limit);
+}
+
+/**
+ * Update a previously-failed transaction with real classification data.
+ */
+const updatePoolTransaction = db.prepare(`
+  UPDATE pool_transactions
+  SET tx_type = ?, side = ?, base_amount = ?, quote_amount = ?,
+      usd_value = ?, trader_wallet = ?, fee = ?,
+      event_type = ?, event_severity = ?,
+      success = 1, error_message = NULL, timestamp = ?
+  WHERE id = ?
+`);
+
+function retryPoolTransaction(id, txType, details = {}) {
+  updatePoolTransaction.run(
+    txType,
+    details.side || null,
+    details.baseAmount || null,
+    details.quoteAmount || null,
+    details.usdValue || null,
+    details.traderWallet || null,
+    details.fee || null,
+    details.eventType || null,
+    details.eventSeverity || null,
+    Date.now(),
+    id
+  );
+}
+
 function closeDb() {
   db.close();
 }
@@ -1215,6 +1428,7 @@ module.exports = {
   getRawHistory,
   getRawExportCsv,
   getParsedLatest,
+  getAllParsedLatest,
   getParsedHistory,
   getRecentTransactions,
   getTransactionStats,
@@ -1224,6 +1438,10 @@ module.exports = {
   getLatestValidations,
   getValidationHistory,
   getDbStats,
+  getSolUsdPrice,
+  getFailedFetchSignatures,
+  retryPoolTransaction,
+  getWalletPoolHistory,
   cleanupOldData,
   closeDb,
 };

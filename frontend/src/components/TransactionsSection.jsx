@@ -1,12 +1,10 @@
 import React, { useState, useEffect, useCallback } from "react";
 import InfoTip from "./Tooltip";
 
-const POOL_OPTIONS = [
+// Pool options are fetched dynamically from the backend config
+// so they always reflect the actual monitored pools.
+const FALLBACK_POOL_OPTIONS = [
   { label: "All Pools", value: "" },
-  { label: "Raydium AMM v4 — SOL/USDC", value: "58oQChx4yWmvKdwLLZzBi4ChoCc2fqCUWBkwMihLYQo2" },
-  { label: "Raydium CPMM — SOL/USDC", value: "7JuwJuNU88gurFnyWeiyGKbFmExMWcmRZntn9imEzdny" },
-  { label: "Orca Whirlpool — SOL/USDC", value: "7qbRF6YsyGuLUVs6Y1q64bdVrfe4ZcUUz1JRdoVNUJnm" },
-  { label: "Meteora DLMM — SOL/USDC", value: "BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y" },
 ];
 
 const PERIOD_OPTIONS = [
@@ -20,6 +18,20 @@ const PERIOD_OPTIONS = [
 function truncAddr(addr) {
   if (!addr) return "—";
   return `${addr.slice(0, 4)}...${addr.slice(-4)}`;
+}
+
+/** Extract base token name from pool label, e.g. "Raydium CPMM — USELESS/SOL" → "USELESS" */
+function getBaseToken(poolLabel) {
+  if (!poolLabel) return "";
+  const match = poolLabel.match(/— (\w+)\//);
+  return match ? match[1] : "SOL";
+}
+
+/** Extract quote token name from pool label, e.g. "Raydium CPMM — USELESS/SOL" → "SOL" */
+function getQuoteToken(poolLabel) {
+  if (!poolLabel) return "";
+  const match = poolLabel.match(/\/(\w+)$/);
+  return match ? match[1] : "USDC";
 }
 
 function formatUsd(val) {
@@ -38,7 +50,7 @@ function formatAmount(val) {
 
 function formatTime(ts) {
   if (!ts) return "—";
-  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
 }
 
 function formatTimeAgo(ts) {
@@ -51,6 +63,10 @@ function formatTimeAgo(ts) {
 
 const EVENT_ICONS = {
   whale: "🐋",
+  large_trade: "💰",
+  accumulator: "🧠",
+  dumper: "🔻",
+  repeat_trader: "🔄",
   liquidity_add: "💧",
   liquidity_remove: "💧",
   new_pool: "🆕",
@@ -114,23 +130,76 @@ function TxTypeLabel({ txType, side }) {
   );
 }
 
+const POOL_COLORS = {
+  "AMM v4": "#f59e0b",
+  "CPMM": "#a855f7",
+  "Whirlpool": "#06b6d4",
+  "DLMM": "#22c55e",
+};
+
+/** Short pool tag: "Raydium CPMM — USELESS/SOL" → "CPMM" with pair on hover */
+function PoolTag({ poolLabel }) {
+  if (!poolLabel) return <span style={{ fontSize: 10, color: "#444" }}>—</span>;
+  // Extract pool type: "Raydium AMM v4 — SOL/USDC" → "AMM v4"
+  const typeMatch = poolLabel.match(/(?:Raydium |Orca |Meteora )?(.+?) — /);
+  const poolType = typeMatch ? typeMatch[1] : poolLabel;
+  // Extract pair: "... — USELESS/SOL" → "USELESS/SOL"
+  const pairMatch = poolLabel.match(/— (.+)$/);
+  const pair = pairMatch ? pairMatch[1] : "";
+  const color = POOL_COLORS[poolType] || "#888";
+
+  return (
+    <span
+      title={poolLabel}
+      style={{
+        fontSize: 10,
+        fontWeight: 600,
+        color,
+        lineHeight: "1.2",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {poolType}
+      {pair && <span style={{ color: "#555", fontWeight: 400 }}>{" "}{pair}</span>}
+    </span>
+  );
+}
+
 function EventBadge({ eventType }) {
   if (!eventType || eventType === "swap") return null;
   const icon = EVENT_ICONS[eventType] || "•";
   const labels = {
     whale: "whale",
+    large_trade: "big",
+    accumulator: "smart",
+    dumper: "dump",
+    repeat_trader: "repeat",
     liquidity_add: "liq",
     liquidity_remove: "liq",
     new_pool: "new",
   };
+  const BADGE_STYLES = {
+    whale:          { bg: "#1e1a2e", border: "#7c3aed", text: "#a78bfa" },
+    large_trade:    { bg: "#1e2a1e", border: "#22c55e", text: "#4ade80" },
+    accumulator:    { bg: "#1a1e2e", border: "#3b82f6", text: "#60a5fa" },
+    dumper:         { bg: "#2e1a1a", border: "#ef4444", text: "#f87171" },
+    repeat_trader:  { bg: "#1e1e1a", border: "#f59e0b", text: "#fbbf24" },
+    liquidity_add:  { bg: "#111", border: "#333", text: "#888" },
+    liquidity_remove: { bg: "#111", border: "#333", text: "#888" },
+    new_pool:       { bg: "#111", border: "#333", text: "#888" },
+  };
+  const s = BADGE_STYLES[eventType] || { bg: "#111", border: "#333", text: "#888" };
+
   return (
     <span style={{
-      background: eventType === "whale" ? "#1e1a2e" : "#111",
-      border: `1px solid ${eventType === "whale" ? "#7c3aed" : "#333"}`,
+      background: s.bg,
+      border: `1px solid ${s.border}`,
       borderRadius: 4,
       padding: "1px 6px",
       fontSize: 10,
-      color: eventType === "whale" ? "#a78bfa" : "#888",
+      color: s.text,
       whiteSpace: "nowrap",
     }}>
       {icon} {labels[eventType] || eventType}
@@ -139,6 +208,7 @@ function EventBadge({ eventType }) {
 }
 
 export default function TransactionsSection() {
+  const [poolOptions, setPoolOptions] = useState(FALLBACK_POOL_OPTIONS);
   const [selectedPool, setSelectedPool] = useState("");
   const [selectedPeriod, setSelectedPeriod] = useState(2); // 1h default
   const [transactions, setTransactions] = useState([]);
@@ -149,6 +219,20 @@ export default function TransactionsSection() {
   const [hasMore, setHasMore] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
 
+  // Fetch pool options from backend config (once)
+  useEffect(() => {
+    fetch("/api/pools")
+      .then((r) => r.json())
+      .then((data) => {
+        const opts = [{ label: "All Pools", value: "" }];
+        for (const p of data.pools || []) {
+          opts.push({ label: p.label, value: p.address });
+        }
+        setPoolOptions(opts);
+      })
+      .catch(() => {});
+  }, []);
+
   const fetchData = useCallback(async () => {
     const period = PERIOD_OPTIONS[selectedPeriod];
     const poolParam = selectedPool ? `&pool=${selectedPool}` : "";
@@ -157,7 +241,7 @@ export default function TransactionsSection() {
       const [txRes, statsRes, eventsRes] = await Promise.all([
         fetch(`/api/transactions/recent?limit=${txLimit}${poolParam}`),
         fetch(`/api/transactions/stats?period=${period.hours}${poolParam}`),
-        fetch(`/api/events?limit=15`),
+        fetch(`/api/events?limit=50`),
       ]);
 
       const txData = await txRes.json();
@@ -209,7 +293,7 @@ export default function TransactionsSection() {
             fontSize: 12,
           }}
         >
-          {POOL_OPTIONS.map((o) => (
+          {poolOptions.map((o) => (
             <option key={o.value} value={o.value}>{o.label}</option>
           ))}
         </select>
@@ -244,12 +328,12 @@ export default function TransactionsSection() {
             label="TXNS"
             value={stats.swapCount?.toLocaleString() || "0"}
             sub={`Buy: ${stats.buyCount || 0} · Sell: ${stats.sellCount || 0}`}
-            hint="Total number of swap transactions detected on this pool during the selected time period. Buy and sell counts reflect the direction from the trader's perspective (buying SOL vs selling SOL)."
+            hint="Total number of swap transactions detected on this pool during the selected time period. Buy and sell counts reflect the direction from the trader's perspective (buying vs selling the base token)."
           />
           <StatCard
             label="Volume"
             value={formatUsd(stats.volumeUsd)}
-            hint="Estimated total USD volume of all swaps in the selected period. For SOL/USDC pools, this is calculated from the USDC (quote) side of each swap. Only includes parsed swaps where amounts could be extracted."
+            hint="Estimated total USD volume of all swaps in the selected period. For USDC-quoted pools, this is the USDC amount directly. For SOL-quoted pools (e.g. USELESS/SOL), the SOL amount is converted to USD using the live SOL price."
           />
           <StatCard
             label="Makers"
@@ -266,13 +350,14 @@ export default function TransactionsSection() {
       )}
 
       {/* Two-column layout: Recent Transactions + Events Feed */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 340px", gap: 16 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 300px", gap: 16 }}>
         {/* Recent Transactions table */}
         <div style={{
           background: "#0d0d0d",
           border: "1px solid #1a1a1a",
           borderRadius: 6,
-          overflow: "hidden",
+          overflowX: "auto",
+          overflowY: "hidden",
         }}>
           <div style={{
             padding: "8px 12px",
@@ -295,14 +380,15 @@ export default function TransactionsSection() {
           {/* Header row */}
           <div style={{
             display: "grid",
-            gridTemplateColumns: "70px 55px 75px 75px 90px 70px",
-            padding: "6px 12px",
+            gridTemplateColumns: "58px 95px 42px 72px 56px 66px 46px",
+            padding: "6px 8px",
             fontSize: 10,
             fontWeight: 700,
             textTransform: "uppercase",
             letterSpacing: 0.5,
             color: "#444",
             borderBottom: "1px solid #111",
+            minWidth: 435,
           }}>
             <span>
               <InfoTip text="When the transaction was confirmed on the Solana blockchain (block time). Displayed in your local timezone.">
@@ -310,17 +396,22 @@ export default function TransactionsSection() {
               </InfoTip>
             </span>
             <span>
-              <InfoTip text={`The classified transaction type. Possible values:\n\n• BUY (green) — A swap where the trader bought SOL with USDC\n• SELL (red) — A swap where the trader sold SOL for USDC\n• ADD LIQ (blue) — Liquidity provider deposited tokens into the pool\n• REM LIQ (yellow) — Liquidity provider withdrew tokens from the pool\n• INIT (purple) — A new pool was initialized/created\n• OTHER (gray) — Transaction touched the pool but wasn't a swap (e.g. bots checking prices, crank operations, oracle updates)\n• UNPARSED (dark) — Non-AMM v4 pools where we collect data but don't parse yet (CPMM, Orca, Meteora)\n• FAILED — Transaction was submitted but failed on-chain\n• ERR — We couldn't fetch the full transaction data from the RPC`}>
+              <InfoTip text="Which DEX pool this transaction belongs to. Shows a short label like 'AMM v4', 'CPMM', 'Whirlpool', or 'DLMM' along with the trading pair.">
+                Pool
+              </InfoTip>
+            </span>
+            <span>
+              <InfoTip text={`The classified transaction type. Possible values:\n\n• BUY (green) — A swap where the trader bought the base token\n• SELL (red) — A swap where the trader sold the base token\n• ADD LIQ (blue) — Liquidity provider deposited tokens into the pool\n• REM LIQ (yellow) — Liquidity provider withdrew tokens from the pool\n• INIT (purple) — A new pool was initialized/created\n• OTHER (gray) — Transaction touched the pool but wasn't a swap (e.g. bots checking prices, crank operations, oracle updates)\n• UNPARSED (dark) — Transaction data was fetched but the classifier couldn't determine the type\n• FAILED — Transaction was submitted but failed on-chain\n• ERR — We couldn't fetch the full transaction data from the RPC`}>
                 Type
               </InfoTip>
             </span>
             <span>
-              <InfoTip text="The amount of SOL (base token) involved in the swap. For buy transactions, this is how much SOL the trader received. For sell transactions, this is how much SOL the trader gave up. Only available for parsed swap transactions.">
+              <InfoTip text="The amount of the base token involved in the swap. For buy transactions, this is how much the trader received. For sell transactions, this is how much the trader gave up. The token symbol varies by pool (e.g. SOL for SOL/USDC, USELESS for USELESS/SOL).">
                 Amount
               </InfoTip>
             </span>
             <span>
-              <InfoTip text="The estimated USD value of the transaction, calculated from the USDC (quote token) side of the swap. Since USDC is a stablecoin pegged to $1, the USDC amount directly approximates the USD value.">
+              <InfoTip text="The estimated USD value of the transaction. For USDC-quoted pools, this is the USDC amount directly. For SOL-quoted pools, the SOL amount is converted to USD using the live SOL/USD price.">
                 USD
               </InfoTip>
             </span>
@@ -348,7 +439,7 @@ export default function TransactionsSection() {
                 key={tx.signature}
                 style={{
                   display: "grid",
-                  gridTemplateColumns: "70px 55px 75px 75px 90px 70px",
+                  gridTemplateColumns: "58px 95px 42px 72px 56px 66px 46px",
                   padding: "5px 12px",
                   fontSize: 12,
                   borderBottom: i < transactions.length - 1 ? "1px solid #0a0a0a" : "none",
@@ -359,9 +450,10 @@ export default function TransactionsSection() {
                 <span style={{ color: "#666", fontSize: 11 }}>
                   {formatTime(tx.timestamp)}
                 </span>
+                <PoolTag poolLabel={tx.poolLabel} />
                 <TxTypeLabel txType={tx.txType} side={tx.side} />
                 <span style={{ color: "#aaa", fontFamily: "monospace", fontSize: 11 }}>
-                  {tx.baseAmount ? `${formatAmount(tx.baseAmount)} SOL` : "—"}
+                  {tx.baseAmount ? `${formatAmount(tx.baseAmount)} ${getBaseToken(tx.poolLabel)}` : "—"}
                 </span>
                 <span style={{ color: "#aaa", fontFamily: "monospace", fontSize: 11 }}>
                   {formatUsd(tx.usdValue)}
@@ -410,15 +502,15 @@ export default function TransactionsSection() {
             fontWeight: 600,
             color: "#888",
           }}>
-            <InfoTip text="Notable events only — whale trades (>$25K), liquidity additions/removals, and new pool creation. Regular swaps are not shown here. Events are detected automatically from transaction analysis.">
+            <InfoTip text={`Notable events detected from transaction analysis:\n\n• 🐋 Whale — Swap > $10K\n• 💰 Large Trade — Swap > $500\n• 🧠 Accumulator — Wallet with 3+ buys, no sells (smart money signal)\n• 🔻 Dumper — Wallet with 3+ sells (potential exit)\n• 🔄 Repeat Trader — Wallet seen 3+ times on a pool\n• 💧 Liquidity — LP deposits/withdrawals\n• 🆕 New Pool — Pool initialization detected`}>
               Events Feed
             </InfoTip>
           </div>
 
-          <div style={{ maxHeight: 400, overflow: "auto" }}>
+          <div style={{ maxHeight: 500, overflow: "auto" }}>
             {events.length === 0 && (
               <div style={{ padding: "20px 12px", color: "#444", fontSize: 12, textAlign: "center" }}>
-                No notable events yet. Whale trades (&gt;$25K), liquidity changes, and new pools will appear here.
+                No notable events yet. Whale trades, large swaps, smart money patterns, and new pools will appear here.
               </div>
             )}
             {events.map((evt, i) => (
@@ -427,7 +519,13 @@ export default function TransactionsSection() {
                 style={{
                   padding: "8px 12px",
                   borderBottom: i < events.length - 1 ? "1px solid #111" : "none",
-                  background: evt.severity === "high" ? "rgba(124, 58, 237, 0.06)" : "transparent",
+                  background: evt.severity === "high"
+                    ? "rgba(124, 58, 237, 0.06)"
+                    : evt.eventType === "accumulator"
+                    ? "rgba(59, 130, 246, 0.05)"
+                    : evt.eventType === "dumper"
+                    ? "rgba(239, 68, 68, 0.05)"
+                    : "transparent",
                 }}
               >
                 <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 2 }}>
@@ -449,10 +547,47 @@ export default function TransactionsSection() {
                 <div style={{ fontSize: 12, color: "#ccc", paddingLeft: 22 }}>
                   {evt.description}
                 </div>
-                {evt.traderWallet && (
+                {/* Extra details row: wallet, value, and links */}
+                <div style={{ fontSize: 10, color: "#555", paddingLeft: 22, marginTop: 2, fontFamily: "monospace", display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+                  {evt.traderWallet && (
+                    <span>{truncAddr(evt.traderWallet)}</span>
+                  )}
+                  {evt.usdValue > 0 && (
+                    <span>{formatUsd(evt.usdValue)}</span>
+                  )}
+                  {evt.signature && (
+                    <a
+                      href={`https://solscan.io/tx/${evt.signature}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: "#3b82f6", textDecoration: "none", fontSize: 10 }}
+                    >
+                      solscan ↗
+                    </a>
+                  )}
+                </div>
+                {/* Pool info for new_pool events */}
+                {evt.eventType === "new_pool" && evt.poolAddress && (
                   <div style={{ fontSize: 10, color: "#555", paddingLeft: 22, marginTop: 2, fontFamily: "monospace" }}>
-                    {truncAddr(evt.traderWallet)}
-                    {evt.usdValue ? ` · ${formatUsd(evt.usdValue)}` : ""}
+                    Pool: <a
+                      href={`https://solscan.io/account/${evt.poolAddress}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{ color: "#888", textDecoration: "none" }}
+                    >
+                      {truncAddr(evt.poolAddress)}
+                    </a>
+                    {evt.poolLabel && (() => {
+                      const typeMatch = evt.poolLabel.match(/(?:Raydium |Orca |Meteora )?(.+?) — /);
+                      const poolType = typeMatch ? typeMatch[1] : null;
+                      const pair = evt.poolLabel.match(/— (.+)$/)?.[1];
+                      return poolType ? (
+                        <span style={{ marginLeft: 6, fontFamily: "system-ui" }}>
+                          <span style={{ color: POOL_COLORS[poolType] || "#888", fontWeight: 600 }}>{poolType}</span>
+                          {pair && <span style={{ color: "#666", fontWeight: 400 }}> {pair}</span>}
+                        </span>
+                      ) : null;
+                    })()}
                   </div>
                 )}
               </div>

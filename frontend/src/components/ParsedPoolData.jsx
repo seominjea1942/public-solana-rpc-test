@@ -52,6 +52,19 @@ const PRICE_CHANGE_HINTS = {
   "24h": "Price change over the last 24 hours. The standard benchmark for daily performance, similar to what you see on CoinGecko or CoinMarketCap.",
 };
 
+const DEX_COLORS = {
+  "Raydium": "#8b5cf6",
+  "Orca": "#00d18c",
+  "Meteora": "#f59e0b",
+};
+
+const DEX_TYPE_HINTS = {
+  "AMM v4": "Raydium's classic constant-product AMM. Uses x*y=k formula with an OpenBook order book for extra liquidity.",
+  "CPMM": "Raydium's Concentrated Product Market Maker. Similar to AMM v4 but without the linked order book.",
+  "Whirlpool": "Orca's concentrated liquidity AMM (similar to Uniswap V3). Liquidity providers choose price ranges for capital efficiency.",
+  "DLMM": "Meteora's Dynamic Liquidity Market Maker. Uses discrete bins instead of a continuous curve, enabling zero-slippage within each bin.",
+};
+
 function PriceChange({ label, value }) {
   if (value == null) return null;
   const color = value > 0 ? "#22c55e" : value < 0 ? "#ef4444" : "#666";
@@ -214,11 +227,60 @@ function ValidationPanel({ validation, poolAddress }) {
   );
 }
 
-export default function ParsedPoolData({ parsedPool, validation }) {
+// ── Multi-pool price comparison bar ──
+function PriceComparisonBar({ pools }) {
+  if (!pools || pools.length === 0) return null;
+
+  return (
+    <div style={{
+      display: "grid",
+      gridTemplateColumns: `repeat(${pools.length}, 1fr)`,
+      gap: 8,
+      marginBottom: 16,
+    }}>
+      {pools.map((p) => {
+        const dexColor = DEX_COLORS[p.dex] || "#666";
+        const pairName = p.poolLabel?.split(" — ")[1] || "";
+        const priceStr = p.price > 0
+          ? p.price >= 1 ? `$${p.price.toFixed(2)}` : `$${p.price.toFixed(4)}`
+          : "—";
+
+        return (
+          <div
+            key={p.poolAddress}
+            style={{
+              background: "#0a0a0a",
+              border: `1px solid ${dexColor}33`,
+              borderRadius: 6,
+              padding: "10px 12px",
+              textAlign: "center",
+            }}
+          >
+            <div style={{ fontSize: 10, color: dexColor, fontWeight: 700, textTransform: "uppercase", marginBottom: 4 }}>
+              {p.dex} {p.poolType}
+            </div>
+            <div style={{ fontSize: 9, color: "#666", marginBottom: 2 }}>
+              {pairName}
+            </div>
+            <div style={{ fontSize: 20, fontWeight: 700, fontFamily: "monospace", color: p.price > 0 ? "#fff" : "#555" }}>
+              {priceStr}
+            </div>
+            <div style={{ fontSize: 11, color: "#666", marginTop: 4 }}>
+              <span style={{ color: "#555" }}>Liq: </span>
+              <span style={{ color: "#888" }}>{formatUsd(p.liquidityUsd)}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Pool detail card ──
+function PoolDetailCard({ pool, validation }) {
   const [history, setHistory] = useState([]);
   const [selectedRange, setSelectedRange] = useState(1); // 1h default
 
-  const pool = parsedPool;
   const poolAddress = pool?.poolAddress;
 
   useEffect(() => {
@@ -247,15 +309,19 @@ export default function ParsedPoolData({ parsedPool, validation }) {
     }));
   }, [history]);
 
-  if (!pool || pool.error) {
-    return (
-      <div style={{ color: "#555", fontSize: 13, padding: "12px 0" }}>
-        Waiting for first Raydium AMM v4 parse... (every ~20s when AMM v4 rotation comes up)
-      </div>
-    );
-  }
+  if (!pool) return null;
 
   const pc = pool.priceChanges || {};
+  const dexColor = DEX_COLORS[pool.dex] || "#8b5cf6";
+  const poolTypeHint = DEX_TYPE_HINTS[pool.poolType] || "";
+
+  // Extract pair name from pool label (e.g., "Raydium CPMM — USELESS/SOL" -> "USELESS/SOL")
+  const pairName = pool.poolLabel?.split(" — ")[1] || "Token Price";
+  const pairParts = pairName.split("/");
+  const baseName = pairParts[0] || "Base";
+  const quoteName = pairParts[1] || "Quote";
+  const isUsdcPair = pairName.includes("USDC") || pairName.includes("USDT");
+  const priceDecimals = pool.price >= 1 ? 4 : pool.price >= 0.001 ? 6 : 8;
 
   return (
     <div>
@@ -263,12 +329,15 @@ export default function ParsedPoolData({ parsedPool, validation }) {
       <div style={{ display: "flex", alignItems: "baseline", gap: 16, marginBottom: 16 }}>
         <div>
           <div style={{ color: "#555", fontSize: 11, textTransform: "uppercase", marginBottom: 2 }}>
-            <InfoTip text="The current price of 1 SOL in USDC, calculated directly from pool reserves (Quote USDC / Base SOL). This is the on-chain DEX price, which may differ slightly from centralized exchange prices.">
-              SOL/USDC Price
+            <InfoTip text={isUsdcPair
+              ? "Price calculated directly from on-chain pool data. Each DEX uses a different price mechanism (AMM formula, sqrt price, or bin-based)."
+              : `Price of 1 ${pairName.split("/")[0]} in USD, calculated from on-chain pool reserves and the current SOL/USD rate from other pools.`
+            }>
+              {pairName} Price {!isUsdcPair && <span style={{ fontSize: 9, color: "#666" }}>(USD)</span>}
             </InfoTip>
           </div>
           <div style={{ color: "#fff", fontSize: 28, fontWeight: 700, fontFamily: "monospace" }}>
-            ${pool.price?.toFixed(4) || "—"}
+            ${pool.price?.toFixed(priceDecimals) || "—"}
           </div>
         </div>
         <div style={{ display: "flex", gap: 16, marginLeft: "auto" }}>
@@ -299,7 +368,7 @@ export default function ParsedPoolData({ parsedPool, validation }) {
                       : i === TIME_RANGES.length - 1
                         ? "0 5px 5px 0"
                         : 0,
-                  background: selectedRange === i ? "#8b5cf6" : "#1a1a1a",
+                  background: selectedRange === i ? dexColor : "#1a1a1a",
                   color: selectedRange === i ? "#fff" : "#888",
                   cursor: "pointer",
                 }}
@@ -334,7 +403,7 @@ export default function ParsedPoolData({ parsedPool, validation }) {
               <Line
                 type="monotone"
                 dataKey="price"
-                stroke="#8b5cf6"
+                stroke={dexColor}
                 strokeWidth={2}
                 dot={false}
                 isAnimationActive={false}
@@ -348,91 +417,73 @@ export default function ParsedPoolData({ parsedPool, validation }) {
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 16 }}>
         {/* Amounts */}
         <div style={{ background: "#0d0d0d", border: "1px solid #1a1a1a", borderRadius: 6, padding: 12 }}>
-          <div style={{ color: "#8b5cf6", fontSize: 11, fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
-            <InfoTip text="The actual token balances held inside this AMM liquidity pool. These reserves determine the exchange rate: when you swap, tokens move in/out of these reserves. The ratio of Base to Quote sets the price." noUnderline>
+          <div style={{ color: dexColor, fontSize: 11, fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
+            <InfoTip text="The actual token balances held inside this liquidity pool. These reserves determine the exchange rate." noUnderline>
               Pool Reserves
             </InfoTip>
           </div>
           <StatRow
-            label="Base (SOL)"
+            label={`Base (${baseName})`}
             value={formatAmount(pool.baseAmount, 4)}
             mono
-            hint="The amount of SOL tokens currently held in this pool's reserve vault. When someone buys SOL, this decreases; when someone sells SOL, this increases."
+            hint={`The amount of ${baseName} tokens currently held in this pool's reserve vault.`}
           />
           <StatRow
-            label="Quote (USDC)"
+            label={`Quote (${quoteName})`}
             value={formatAmount(pool.quoteAmount, 2)}
             mono
-            hint="The amount of USDC (a US dollar stablecoin) held in this pool's reserve vault. This is the other side of the trading pair. Price is calculated as Quote / Base."
+            hint={`The amount of ${quoteName} held in this pool's reserve vault.`}
           />
           <StatRow
             label="Liquidity"
             value={formatUsd(pool.liquidityUsd)}
             mono
-            hint="Total Value Locked (TVL) — the combined USD value of both tokens in the pool. Higher liquidity means less price impact (slippage) when trading. Calculated as 2 x Quote amount."
+            hint="Total Value Locked (TVL) — the combined USD value of both tokens in the pool."
           />
           <StatRow
             label="Fee Rate"
             value={pool.feeRate != null ? `${(pool.feeRate * 100).toFixed(2)}%` : "—"}
-            hint="The percentage fee charged on every swap through this pool. This fee is distributed to liquidity providers (LPs) as reward for providing their tokens to the pool."
+            hint="The percentage fee charged on every swap through this pool."
           />
           <StatRow
             label="Status"
             value={pool.status ?? "—"}
-            hint="The pool's on-chain status flag. Status 6 means the pool is active and fully operational. Other values may indicate the pool is paused, disabled, or in a special state."
+            hint="The pool's on-chain status flag."
           />
+          {pool.poolType === "Whirlpool" && pool.tickCurrentIndex != null && (
+            <>
+              <StatRow label="Tick Index" value={pool.tickCurrentIndex} mono hint="Current tick index in the Whirlpool's concentrated liquidity range." />
+              <StatRow label="Tick Spacing" value={pool.tickSpacing ?? "—"} mono hint="Minimum tick spacing for this Whirlpool pool." />
+            </>
+          )}
+          {pool.poolType === "DLMM" && pool.activeId != null && (
+            <>
+              <StatRow label="Active Bin" value={pool.activeId} mono hint="The currently active bin ID in the DLMM." />
+              <StatRow label="Bin Step" value={pool.binStep ?? "—"} mono hint="Price step between adjacent bins (in basis points / 100)." />
+            </>
+          )}
         </div>
 
         {/* Addresses */}
         <div style={{ background: "#0d0d0d", border: "1px solid #1a1a1a", borderRadius: 6, padding: 12 }}>
-          <div style={{ color: "#8b5cf6", fontSize: 11, fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
-            <InfoTip text="On-chain Solana addresses that make up this pool. Each pool has token 'mints' (the token type definitions), 'vaults' (the accounts holding actual tokens), and a linked order book market." noUnderline>
+          <div style={{ color: dexColor, fontSize: 11, fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
+            <InfoTip text="On-chain Solana addresses that make up this pool." noUnderline>
               Pool Accounts
             </InfoTip>
           </div>
-          <StatRow
-            label="Base Mint"
-            value={truncAddr(pool.baseMint)}
-            mono
-            hint="The token contract address (mint) for the base token (SOL). On Solana, every token type has a unique 'mint' address that identifies it. This is like the token's ID card."
-          />
-          <StatRow
-            label="Quote Mint"
-            value={truncAddr(pool.quoteMint)}
-            mono
-            hint="The token contract address (mint) for the quote token (USDC). The quote token is what the base token is priced in — similar to how stocks are priced in USD."
-          />
-          <StatRow
-            label="LP Mint"
-            value={truncAddr(pool.lpMint)}
-            mono
-            hint="The mint address for LP (Liquidity Provider) tokens. When you deposit tokens into the pool, you receive LP tokens as a receipt. They represent your share of the pool."
-          />
-          <StatRow
-            label="Base Vault"
-            value={truncAddr(pool.baseVault)}
-            mono
-            hint="The on-chain token account that physically holds the pool's SOL reserves. We query this vault's balance to know exactly how much SOL the pool contains right now."
-          />
-          <StatRow
-            label="Quote Vault"
-            value={truncAddr(pool.quoteVault)}
-            mono
-            hint="The on-chain token account that physically holds the pool's USDC reserves. We query this vault's balance along with the base vault to calculate the current price."
-          />
-          <StatRow
-            label="Market ID"
-            value={truncAddr(pool.marketId)}
-            mono
-            hint="The OpenBook (formerly Serum) order book market linked to this AMM. Raydium AMM v4 pairs with an on-chain order book for additional liquidity and tighter spreads."
-          />
+          <StatRow label="Base Mint" value={truncAddr(pool.baseMint)} mono hint={`Token contract address for the base token (${baseName}).`} />
+          <StatRow label="Quote Mint" value={truncAddr(pool.quoteMint)} mono hint={`Token contract address for the quote token (${quoteName}).`} />
+          {pool.lpMint && <StatRow label="LP Mint" value={truncAddr(pool.lpMint)} mono hint="Mint address for LP tokens issued to liquidity providers." />}
+          <StatRow label="Base Vault" value={truncAddr(pool.baseVault)} mono hint={`Token account holding the pool's ${baseName} reserves.`} />
+          <StatRow label="Quote Vault" value={truncAddr(pool.quoteVault)} mono hint={`Token account holding the pool's ${quoteName} reserves.`} />
+          {pool.marketId && <StatRow label="Market ID" value={truncAddr(pool.marketId)} mono hint="OpenBook order book market linked to this AMM." />}
         </div>
       </div>
 
       {/* Price Validation */}
       <div style={{ marginBottom: 16 }}>
-        <div style={{ color: "#8b5cf6", fontSize: 11, fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
-          <InfoTip text="Automated price check: every 5 minutes, our parsed on-chain price is compared against DexScreener's API. This validates that our binary data parsing is correct. A small difference (< 0.5%) is expected due to timing — prices move between our fetch and DexScreener's report." noUnderline>
+        <div style={{ color: dexColor, fontSize: 11, fontWeight: 700, textTransform: "uppercase", marginBottom: 8 }}>
+          <InfoTip text="Automated price check: every 5 minutes, our parsed on-chain price is compared against DexScreener's API." noUnderline>
             Price Validation
           </InfoTip>
         </div>
@@ -452,23 +503,95 @@ export default function ParsedPoolData({ parsedPool, validation }) {
         }}
       >
         <span>
-          <InfoTip text="When this pool data was last decoded from its raw on-chain account data. The parser runs every ~20 seconds when the AMM v4 pool comes up in the rotation cycle.">Last parsed</InfoTip>:{" "}
+          <InfoTip text={`DEX type: ${poolTypeHint}`}>Type</InfoTip>:{" "}
+          <span style={{ color: dexColor }}>{pool.dex} {pool.poolType}</span>
+        </span>
+        <span>
+          Last parsed:{" "}
           <span style={{ color: "#aaa" }}>{formatTime(pool.timestamp)}</span>
         </span>
         <span>
-          <InfoTip text="The Solana blockchain slot number when this data was read. Solana produces ~2.5 slots/sec. Slots are like block numbers — they tell you exactly which point in time the data comes from.">Slot</InfoTip>:{" "}
+          Slot:{" "}
           <span style={{ color: "#aaa", fontFamily: "monospace" }}>{pool.slot?.toLocaleString() || "—"}</span>
         </span>
         {pool.parseStats && (
-          <>
-            <span>
-              <InfoTip text="How many times we've successfully decoded the raw pool data. Parse failures can happen if the account data format is unexpected or an RPC call fails. A high success rate means the data pipeline is healthy.">Parses</InfoTip>:{" "}
-              <span style={{ color: "#aaa" }}>{pool.parseStats.total}</span>
-              {" "}({pool.parseStats.successRate}% success)
-            </span>
-          </>
+          <span>
+            Parses:{" "}
+            <span style={{ color: "#aaa" }}>{pool.parseStats.total}</span>
+            {" "}({pool.parseStats.successRate}% success)
+          </span>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── Main component ──
+export default function ParsedPoolData({ parsedPools, parsedPool, validation }) {
+  const [selectedPoolIdx, setSelectedPoolIdx] = useState(0);
+
+  // Use parsedPools if available, fall back to single parsedPool
+  const pools = parsedPools && parsedPools.length > 0
+    ? parsedPools
+    : parsedPool ? [parsedPool] : [];
+
+  const selectedPool = pools[selectedPoolIdx] || pools[0] || null;
+
+  if (pools.length === 0) {
+    return (
+      <div style={{ color: "#555", fontSize: 13, padding: "12px 0" }}>
+        Waiting for first pool parse... (scheduler starts ~10s after boot, then cycles every ~30s)
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {/* Price comparison bar - all pools at a glance */}
+      <PriceComparisonBar pools={pools} />
+
+      {/* Pool selector tabs */}
+      {pools.length > 1 && (
+        <div style={{ display: "flex", gap: 0, marginBottom: 16 }}>
+          {pools.map((p, i) => {
+            const dexColor = DEX_COLORS[p.dex] || "#666";
+            const isSelected = i === selectedPoolIdx;
+            return (
+              <button
+                key={p.poolAddress || i}
+                onClick={() => setSelectedPoolIdx(i)}
+                style={{
+                  padding: "8px 16px",
+                  fontSize: 12,
+                  fontWeight: isSelected ? 700 : 500,
+                  border: `1px solid ${isSelected ? dexColor : "#333"}`,
+                  borderRight: i < pools.length - 1 ? "none" : undefined,
+                  borderRadius:
+                    i === 0
+                      ? "6px 0 0 6px"
+                      : i === pools.length - 1
+                        ? "0 6px 6px 0"
+                        : 0,
+                  background: isSelected ? `${dexColor}22` : "#0d0d0d",
+                  color: isSelected ? dexColor : "#666",
+                  cursor: "pointer",
+                  transition: "all 0.15s",
+                }}
+              >
+                {p.dex} {p.poolType}
+                {p.price > 0 && (
+                  <span style={{ marginLeft: 8, fontFamily: "monospace", fontSize: 11 }}>
+                    ${p.price.toFixed(2)}
+                  </span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Selected pool detail */}
+      <PoolDetailCard pool={selectedPool} validation={validation} />
     </div>
   );
 }

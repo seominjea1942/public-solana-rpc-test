@@ -1,7 +1,7 @@
-const { POOL_ACCOUNTS } = require("./config");
+const { POOL_ACCOUNTS, RPC_ENDPOINTS } = require("./config");
 const { rateLimitedRpcPost, limiter } = require("./rate-limiter");
-const { parseRaydiumAmmV4 } = require("./pool-parser");
-const { runTxMonitor } = require("./tx-monitor");
+const { parsePoolState, hasParser } = require("./parsers");
+const { runTxMonitor, retryFailedTransactions } = require("./tx-monitor");
 const { maybeValidate } = require("./price-validator");
 const {
   writeRawAccountData,
@@ -60,6 +60,21 @@ function initTaskStatus() {
       lastError: null,
     });
   }
+
+  // Retry task (rotates through all pools)
+  taskStatus.set("txRetry:rotate", {
+    task: "txRetry",
+    pool: "Rotating",
+    poolAddress: "",
+    dex: "",
+    poolType: "",
+    lastRun: null,
+    lastDurationMs: null,
+    lastStatus: "pending",
+    itemsProcessed: 0,
+    rpcCalls: 0,
+    lastError: null,
+  });
 }
 
 // ── Task execution with overlap protection ──
@@ -142,7 +157,7 @@ function getPoolForKey(taskKey) {
   return POOL_ACCOUNTS.find((p) => p.address === addr) || null;
 }
 
-// ── Part A — Pool State Parser ──
+// ── Part A — Pool State Parser (all DEX types) ──
 
 async function runPoolStateTask(pool) {
   const rpcUrl = _getPrimaryUrl();
@@ -168,15 +183,15 @@ async function runPoolStateTask(pool) {
     return { success: false, error: accountResult.error, rpcCalls, itemsProcessed: 0 };
   }
 
-  // 2. If AMM v4, decode + fetch vault balances + calculate price
-  if (pool.poolType === "AMM v4") {
+  // 2. Parse pool state using the unified parser interface
+  if (hasParser(pool.poolType)) {
     const base64Data = accountResult.data?.value?.data?.[0];
     const slot = accountResult.data?.context?.slot;
     if (base64Data) {
       try {
-        const parsed = await parseRaydiumAmmV4(rpcUrl, base64Data, slot);
-        rpcCalls += 2; // vault balance queries
-        writeParsedPoolData(pool.address, pool.label, parsed);
+        const parsed = await parsePoolState(rpcUrl, pool.poolType, base64Data, slot);
+        rpcCalls += 2; // vault balance queries (all parsers fetch 2 vault balances)
+        writeParsedPoolData(pool.address, pool.label, parsed, pool.dex, pool.poolType);
 
         // Validate price against DexScreener (rate-limited: once per 5 min per pool)
         if (parsed.price > 0) {
@@ -192,14 +207,14 @@ async function runPoolStateTask(pool) {
           writeParsedPoolData(pool.address, pool.label, {
             parseSuccess: false,
             error: err.message,
-          });
+          }, pool.dex, pool.poolType);
         } catch {}
         return { success: false, error: err.message, rpcCalls, itemsProcessed: 0 };
       }
     }
   }
 
-  // Non-AMM v4: just collected raw data, no parsing yet
+  // No parser for this pool type: just collected raw data
   return { success: true, rpcCalls, itemsProcessed: 1 };
 }
 
@@ -215,6 +230,44 @@ async function runTxMonitorTask(pool) {
     error: result.error || null,
     rpcCalls: result.rpcCalls,
     itemsProcessed: result.newTxCount || 0,
+  };
+}
+
+// ── Part C — Retry failed transaction fetches ──
+// Rotates through pools, retrying 2 failed txns per cycle.
+// This recovers transactions that were lost to 429 rate limiting.
+
+let _retryPoolIdx = 0;
+
+/**
+ * Pick a secondary RPC URL for retries.
+ * Uses a non-primary endpoint to avoid adding to the primary's rate limit burden.
+ * Falls back to primary if only one endpoint is available.
+ */
+function getRetryRpcUrl() {
+  const primaryUrl = _getPrimaryUrl();
+  // Find a different endpoint
+  for (const ep of RPC_ENDPOINTS) {
+    if (ep.http !== primaryUrl) return ep.http;
+  }
+  return primaryUrl; // fallback
+}
+
+async function runRetryTask() {
+  // Use a secondary RPC endpoint for retries to avoid adding to primary's 429 load
+  const rpcUrl = getRetryRpcUrl();
+  if (!rpcUrl) return { success: false, error: "No RPC URL", rpcCalls: 0, itemsProcessed: 0 };
+
+  const pool = POOL_ACCOUNTS[_retryPoolIdx];
+  _retryPoolIdx = (_retryPoolIdx + 1) % POOL_ACCOUNTS.length;
+
+  if (!pool) return { success: true, rpcCalls: 0, itemsProcessed: 0 };
+
+  const result = await retryFailedTransactions(pool, rpcUrl, 5);
+  return {
+    success: true,
+    rpcCalls: result.rpcCalls,
+    itemsProcessed: result.successCount,
   };
 }
 
@@ -245,6 +298,12 @@ function runCycle() {
       }
     }, delay);
   }
+
+  // Schedule retry task at the end of the cycle (offset 29s in a 30s cycle)
+  // This runs after all main tasks, using any remaining rate limit budget
+  setTimeout(() => {
+    executeTask("txRetry:rotate", runRetryTask);
+  }, 29000);
 }
 
 // ── Graceful degradation ──

@@ -71,9 +71,11 @@ const POOL_ACCOUNTS = [
     programId: "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
   },
   // === Raydium CPMM (newer, growing fast, 49% of Raydium swap revenue) ===
+  // Note: No high-liquidity SOL/USDC CPMM pool exists on Raydium.
+  // Using USELESS/SOL ($1.7M liq, 3800 txns/day) to demonstrate CPMM parsing.
   {
-    address: "7JuwJuNU88gurFnyWeiyGKbFmExMWcmRZntn9imEzdny",
-    label: "Raydium CPMM — SOL/USDC",
+    address: "Q2sPHPdUWFMg7M7wwrQKLrn619cAucfRsmhVJffodSp",
+    label: "Raydium CPMM — USELESS/SOL",
     dex: "Raydium",
     poolType: "CPMM",
     programId: "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",
